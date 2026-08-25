@@ -1,0 +1,14 @@
+<library path="lib/libmoveit_isaac_controller_manager">
+
+  <class
+      name="moveit_isaac_controller_manager/IsaacControllerManager"
+      type="moveit_isaac_controller_manager::IsaacControllerManager"
+      base_class_type="moveit_controller_manager::MoveItControllerManager">
+
+    <description>
+      MoveIt controller manager for Isaac Sim.
+    </description>
+
+  </class>
+
+</library>

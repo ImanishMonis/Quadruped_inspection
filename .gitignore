@@ -1,0 +1,15 @@
+# ROS Catkin build artifacts
+ros_noetic/build/
+ros_noetic/devel/
+ros_noetic/logs/
+ros_noetic/.catkin_tools/
+
+# Python compiled files
+*.pyc
+__pycache__/
+*.so
+*.o
+*.pcd
+*.npy
+*.ply
+**/example_data/

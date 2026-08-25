@@ -1,0 +1,18 @@
+<launch>
+
+  <!-- execute the trajectory in 'interpolate' mode or jump to goal position in 'last point' mode -->
+  <arg name="fake_execution_type" default="interpolate" />
+
+  <!-- Set the param that trajectory_execution_manager needs to find the controller plugin -->
+  <param name="moveit_controller_manager" value="moveit_isaac_controller_manager/IsaacControllerManager"/>
+
+  <!-- The rest of the params are specific to this plugin -->
+  <rosparam subst_value="true" file="$(find X_moveit_config)/config/fake_controllers.yaml"/>
+
+  <!-- IsaacControllerManager publishes planned trajectories on /joint_trajectory; this bridges
+       them to the /joint_command JointState topic that Isaac Sim's ROS1 bridge subscribes to.
+       Without this node, execution reports success but nothing ever reaches the simulator. -->
+  <node name="trajectory_bridge" pkg="open_manipulator_control" type="trajectory_bridge.py"
+        respawn="true" output="screen" />
+
+</launch>

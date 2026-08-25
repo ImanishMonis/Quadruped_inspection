@@ -1,0 +1,1 @@
+python demo.py --checkpoint_path /workspace/checkpoint_detection.tar --vis
