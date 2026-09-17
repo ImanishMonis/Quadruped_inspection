@@ -43,6 +43,8 @@ narrowing the depth range further cannot manufacture points that were
 never captured. Reposition the arm/camera for real clearance first.
 """
 
+import json
+
 import numpy as np
 import rospy
 import sensor_msgs.msg
@@ -50,6 +52,13 @@ import sensor_msgs.msg
 
 DEPTH_TOPIC = "/camera/depth/image_raw"
 CAMERA_INFO_TOPIC = "/camera/color/camera_info"
+
+# Frame whose +Z axis is treated as "up" when recording the sidecar
+# metadata below. link1 (not world) on purpose: the base-teleport virtual
+# joint is planar (x, y, yaw only), so link1's +Z is identical to world's
+# +Z, and link1 is always in the TF tree - world only exists while a
+# BaseTeleporter happens to be broadcasting.
+UP_REFERENCE_FRAME = "link1"
 
 MIN_DEPTH = 0.12   # meters; discard anything closer (near-clip/self-body noise)
 MAX_DEPTH = 2.0    # meters; discard anything farther (background/no-return)
@@ -154,6 +163,70 @@ def write_pcd(path, points):
             f.write(f"{x} {y} {z}\n")
 
 
+def sidecar_path(scene_path):
+    """Metadata file written next to a captured scene.pcd."""
+    return scene_path + ".meta.json"
+
+
+def write_capture_metadata(scene_path, camera_frame,
+                            up_reference_frame=UP_REFERENCE_FRAME):
+    """
+    Record the "up" direction expressed in the camera's own frame, next to
+    the captured cloud, as <scene_path>.meta.json.
+
+    Why (added 2026-09-17): the AnyGrasp container deliberately has no ROS
+    and no TF (AGENT.md), so it cannot tell which way is up on its own -
+    which is why the old server-side filter_parallel_grasps() had to assume
+    a fixed camera orientation and got it wrong (BUG-18). But the level
+    test grasp_planner.select_level_grasp() does on the ROS side,
+    |dot(approach_world, world_Z)| <= sin(tilt), is mathematically
+    identical to |dot(approach_camera, up_in_camera)| <= sin(tilt). So a
+    single 3-vector is enough for the AnyGrasp side (main.py) to reproduce
+    the *exact* same selection, with no ROS dependency.
+
+    Best-effort: TF may not be available (e.g. importing this module
+    outside a live session), in which case nothing is written and the
+    AnyGrasp side just falls back to its own --up-vector argument.
+    """
+    try:
+        import tf2_ros
+        from tf.transformations import quaternion_matrix
+
+        tf_buffer = tf2_ros.Buffer()
+        tf2_ros.TransformListener(tf_buffer)
+        rospy.sleep(1.0)  # let the listener fill
+
+        t = tf_buffer.lookup_transform(
+            up_reference_frame, camera_frame, rospy.Time(0), rospy.Duration(2.0)
+        )
+        q = t.transform.rotation
+        # Rotation taking camera-frame vectors into up_reference_frame.
+        rot = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
+        # "Up" is +Z of up_reference_frame; express it back in camera frame.
+        up_in_camera = rot.T @ np.array([0.0, 0.0, 1.0])
+
+        meta = {
+            "camera_frame": camera_frame,
+            "up_reference_frame": up_reference_frame,
+            "up_vector_in_camera": [float(v) for v in up_in_camera],
+        }
+        with open(sidecar_path(scene_path), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        rospy.loginfo(
+            "Wrote %s (up vector in camera frame: [%.3f, %.3f, %.3f])",
+            sidecar_path(scene_path), *up_in_camera,
+        )
+        return meta
+
+    except Exception as exc:
+        rospy.logwarn(
+            "Could not write capture metadata (%s) - the AnyGrasp side's "
+            "--level-only will need an explicit --up-vector instead.", exc,
+        )
+        return None
+
+
 def capture_scene_and_object(scene_path, object_path,
                               min_depth=OBJECT_MIN_DEPTH,
                               max_depth=OBJECT_MAX_DEPTH,
@@ -199,6 +272,7 @@ def capture_scene_and_object(scene_path, object_path,
 
     write_pcd(scene_path, scene_points)
     write_pcd(object_path, object_points)
+    write_capture_metadata(scene_path, frame_id)
 
     return scene_points, object_points, frame_id
 

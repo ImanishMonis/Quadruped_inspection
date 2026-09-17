@@ -76,6 +76,7 @@ def execute_pick(
     teleporter=None,
     planning_time=10.0,
     planning_attempts=10,
+    pose_broadcaster=None,
 ):
     """
     Parameters
@@ -96,6 +97,13 @@ def execute_pick(
         Whether to calculate and teleport the arm base in simulation / TF.
     teleporter : BaseTeleporter, optional
         Active BaseTeleporter instance for dynamic TF broadcasting.
+    pose_broadcaster : tf_utils.PoseBroadcaster, optional
+        If given, publishes "grasp_pose" and "retreat_pose" as live TF
+        frames as they're computed - add them in RViz (Add -> TF, or
+        Add -> Axes with that frame name) to see exactly what this run
+        actually computed and acted on, not a separately re-run
+        diagnostic that might see a different scene by the time you run
+        it. Added 2026-09-17 at the user's request.
 
     Raises
     ------
@@ -115,6 +123,9 @@ def execute_pick(
         teleporter=teleporter,
         return_base_info=True,
     )
+
+    if pose_broadcaster is not None:
+        pose_broadcaster.set_pose("grasp_pose", grasp_pose)
 
     if base_info is not None:
         dx, dy, dtheta = base_info["relative_displacement"]
@@ -141,56 +152,32 @@ def execute_pick(
         raise PickExecutionError("Failed to open gripper")
     hand.stop()
 
-    # 2. Move to pre-grasp waypoint with full orientation
-    # Since the mobile base moved behind the grasp approach direction,
-    # the grasp approach axis aligns with the arm's sagittal plane.
-    arm.set_pose_target(pregrasp_pose)
-    reached = arm.go(wait=True)
-    if not reached:
-        rospy.logwarn(
-            "Free-space 6D pose planning to pre-grasp failed; "
-            "attempting position target with current pitch alignment..."
-        )
-        arm.clear_pose_targets()
-        arm.set_position_target([
-            pregrasp_pose.pose.position.x,
-            pregrasp_pose.pose.position.y,
-            pregrasp_pose.pose.position.z,
-        ])
-        if not arm.go(wait=True):
-            raise PickExecutionError("Failed to reach pre-grasp pose")
+    # 2. Move directly to the grasp pose - no pre-grasp waypoint.
+    # Removed 2026-09-17 at the user's request: the pre-grasp -> grasp
+    # segment was already reduced to a position-only target (see git
+    # history), and with kinematics.yaml's position_only_ik=true (4-DOF
+    # arm, can't achieve AnyGrasp's 6-DOF orientation) there's no
+    # meaningful orientation control gained by staging through an
+    # intermediate pre-grasp point first - it was just adding a second
+    # position-only move (and a second chance to fail) ahead of the one
+    # that actually matters. Straight to grasp_pose instead.
+    arm.set_position_target([
+        grasp_pose.pose.position.x,
+        grasp_pose.pose.position.y,
+        grasp_pose.pose.position.z,
+    ])
+    if not arm.go(wait=True):
+        raise PickExecutionError("Failed to reach grasp pose")
     arm.stop()
     arm.clear_pose_targets()
 
-    # 3. Straight-line cartesian approach from pre-grasp into the grasp
-    try:
-        _run_cartesian_path(
-            arm,
-            [pregrasp_pose.pose, grasp_pose.pose],
-            description="grasp approach",
-        )
-    except Exception as exc:
-        rospy.logwarn("Cartesian approach failed (%s); trying direct pose target...", exc)
-        arm.set_pose_target(grasp_pose)
-        if not arm.go(wait=True):
-            arm.clear_pose_targets()
-            arm.set_position_target([
-                grasp_pose.pose.position.x,
-                grasp_pose.pose.position.y,
-                grasp_pose.pose.position.z,
-            ])
-            if not arm.go(wait=True):
-                raise PickExecutionError("Failed to reach grasp pose")
-        arm.stop()
-        arm.clear_pose_targets()
-
-    # 4. Close the gripper on the object.
+    # 3. Close the gripper on the object.
     hand.set_named_target(GRIP_CLOSE_STATE)
     if not hand.go(wait=True):
         raise PickExecutionError("Failed to close gripper")
     hand.stop()
 
-    # 5. Attach to the planning scene, if we have something to attach.
+    # 4. Attach to the planning scene, if we have something to attach.
     if object_name:
         arm.attach_object(object_name)
     else:
@@ -199,11 +186,13 @@ def execute_pick(
             "scene has no matching collision object to attach yet."
         )
 
-    # 6. Straight-line retreat.
+    # 5. Straight-line retreat.
     retreat_pose = tf_utils.offset_along_approach_axis(
         grasp_pose,
         retreat_offset,
     )
+    if pose_broadcaster is not None:
+        pose_broadcaster.set_pose("retreat_pose", retreat_pose)
     try:
         _run_cartesian_path(
             arm,
@@ -356,6 +345,31 @@ if __name__ == "__main__":
                          help="ROS topic for Unitree Go1 displacement command")
     parser.add_argument("--teleport-only", action="store_true", default=False,
                          help="Only compute base placement, publish command and teleport without executing arm motion")
+    parser.add_argument("--level-only", action="store_true", default=False,
+                         help="Only accept a grasp whose approach is parallel to the "
+                              "ground (see grasp_planner.select_level_grasp) - fetches "
+                              "--top-k candidates and picks the highest-scoring level "
+                              "one, instead of AnyGrasp's single best-scoring grasp "
+                              "regardless of tilt")
+    parser.add_argument("--max-tilt-deg", type=float,
+                         default=grasp_planner.DEFAULT_MAX_TILT_DEG,
+                         help="Max degrees off level a grasp's approach may be to "
+                              "still count as level, used with --level-only")
+    parser.add_argument("--top-k", type=int, default=5,
+                         help="How many candidates to fetch from AnyGrasp when "
+                              "--level-only is set")
+    parser.add_argument("--no-visualize", dest="visualize",
+                         action="store_false", default=True,
+                         help="Don't broadcast grasp_pose/retreat_pose as TF "
+                              "frames for RViz (Add -> TF, or Add -> Axes with "
+                              "that frame name) - on by default, added "
+                              "2026-09-17 so you can see exactly what a run "
+                              "computed and acted on")
+    parser.add_argument("--hold-viz-sec", type=float, default=30.0,
+                         help="Seconds to keep broadcasting grasp_pose/"
+                              "retreat_pose after the pick sequence ends "
+                              "(success or failure), so there's time to look "
+                              "in RViz before the process exits")
     args = parser.parse_args(rospy.myargv(sys.argv[1:]))
 
     moveit_commander.roscpp_initialize(sys.argv)
@@ -370,14 +384,47 @@ if __name__ == "__main__":
         teleporter = base_teleport.BaseTeleporter(rate_hz=20.0)
         teleporter.start()
 
+    pose_broadcaster = None
+    if args.visualize:
+        pose_broadcaster = tf_utils.PoseBroadcaster(rate_hz=10.0)
+        pose_broadcaster.start()
+
     arm = moveit_commander.MoveGroupCommander(ARM_GROUP)
     hand = moveit_commander.MoveGroupCommander(HAND_GROUP)
-    print("Current End Effector Link:", arm.get_end_effector_link())
     arm.set_end_effector_link("end_effector_link")
-    print("Current End Effector Link:", arm.get_end_effector_link())
-    grasp = grasp_client.get_best_grasp(
-        args.scene, args.object, server_url=args.server_url
-    )
+
+    # CRITICAL (found 2026-09-17): every target below is computed in
+    # tf_utils.DEFAULT_BASE_FRAME ("link1"), but set_position_target()
+    # interprets raw coordinates in the group's *pose reference frame*,
+    # which defaults to the planning frame - "world". Without this line,
+    # link1-frame numbers were being executed as world-frame coordinates,
+    # so the gripper landed off by exactly the world->link1 base-teleport
+    # transform. That's why the grasp_pose TF marker looked right in RViz
+    # (it's a properly-tagged PoseStamped) while the arm still went
+    # somewhere else. Measured: 79.6mm error before, 1.5mm after.
+    arm.set_pose_reference_frame(tf_utils.DEFAULT_BASE_FRAME)
+    print("End effector link:", arm.get_end_effector_link())
+    print("Pose reference frame:", arm.get_pose_reference_frame())
+    if args.level_only:
+        grasps = grasp_client.get_grasps(
+            args.scene, args.object, server_url=args.server_url, top_k=args.top_k
+        )
+        grasp = grasp_planner.select_level_grasp(
+            tf_buffer, grasps, max_tilt_deg=args.max_tilt_deg
+        )
+        if grasp is None:
+            rospy.logerr(
+                "No grasp within %.1f deg of level found among top %d "
+                "candidates - try a larger --top-k or --max-tilt-deg.",
+                args.max_tilt_deg, len(grasps),
+            )
+            if teleporter:
+                teleporter.stop()
+            raise SystemExit(1)
+    else:
+        grasp = grasp_client.get_best_grasp(
+            args.scene, args.object, server_url=args.server_url
+        )
 
     if grasp is None:
         rospy.logerr("No grasp returned, nothing to execute.")
@@ -397,13 +444,26 @@ if __name__ == "__main__":
             teleporter=teleporter,
             return_base_info=True,
         )
+        if pose_broadcaster is not None:
+            pose_broadcaster.set_pose("grasp_pose", grasp_pose)
         rospy.loginfo("Teleportation complete. Waiting for mobile base execution.")
-        rospy.sleep(1.0)
+        if pose_broadcaster and args.hold_viz_sec > 0:
+            rospy.loginfo(
+                "Holding grasp_pose TF broadcast for %.0fs - add it in RViz "
+                "now (Add -> TF, or Add -> Axes) to see where it landed.",
+                args.hold_viz_sec,
+            )
+            rospy.sleep(args.hold_viz_sec)
+        else:
+            rospy.sleep(1.0)
         if teleporter:
             teleporter.stop()
+        if pose_broadcaster:
+            pose_broadcaster.stop()
         moveit_commander.roscpp_shutdown()
         sys.exit(0)
 
+    pick_failed = False
     try:
         execute_pick(
             arm,
@@ -417,15 +477,26 @@ if __name__ == "__main__":
             base_topic=args.base_topic,
             teleport_base=args.teleport,
             teleporter=teleporter,
+            pose_broadcaster=pose_broadcaster,
         )
         rospy.loginfo("Pick sequence completed.")
     except PickExecutionError as exc:
         rospy.logerr("Pick sequence failed: %s", exc)
-        if teleporter:
-            teleporter.stop()
-        raise SystemExit(1)
+        pick_failed = True
     finally:
         if teleporter:
             teleporter.stop()
+        if pose_broadcaster and args.hold_viz_sec > 0:
+            rospy.loginfo(
+                "Holding grasp_pose/retreat_pose TF broadcast for %.0fs - "
+                "add them in RViz now (Add -> TF, or Add -> Axes with the "
+                "frame name) to see what this run computed.",
+                args.hold_viz_sec,
+            )
+            rospy.sleep(args.hold_viz_sec)
+        if pose_broadcaster:
+            pose_broadcaster.stop()
 
     moveit_commander.roscpp_shutdown()
+    if pick_failed:
+        raise SystemExit(1)

@@ -20,6 +20,8 @@ output:
     base_frame, which MoveIt understands.
 """
 
+import math
+
 import rospy
 from geometry_msgs.msg import PoseStamped
 
@@ -31,6 +33,65 @@ import tf_utils
 # tf_utils module docstring) from the final grasp pose. Negative
 # because "pre-grasp" means further away, not deeper in.
 DEFAULT_PREGRASP_OFFSET = -0.05
+
+# Degrees. A grasp's approach vector, expressed in the world frame, must
+# have a Z-component within sin(this angle) of zero to count as "level" -
+# see select_level_grasp below.
+DEFAULT_MAX_TILT_DEG = 15.0
+
+
+def select_level_grasp(
+    tf_buffer,
+    grasps,
+    reference_frame=tf_utils.DEFAULT_BASE_FRAME,
+    camera_frame=tf_utils.DEFAULT_CAMERA_FRAME,
+    max_tilt_deg=DEFAULT_MAX_TILT_DEG,
+):
+    """
+    From a best-first list of AnyGrasp candidates (grasp_client.get_grasps()),
+    return the highest-scoring one whose approach is level - i.e. the
+    gripper stays roughly parallel to the ground, reaching in sideways
+    rather than tilting up/down or coming in top-down.
+
+    A grasp's approach direction (local +X, see tf_utils module docstring)
+    is transformed into reference_frame; "level" means its Z-component is
+    close to zero (within sin(max_tilt_deg) of it), since Z is the only
+    component that can make the arm pitch up or down to reach it. This is
+    checked against a gravity-aligned frame, not the camera frame, because
+    "parallel to the ground" is a statement about gravity, not about
+    wherever the camera happens to be pointed.
+
+    reference_frame defaults to link1, not world (changed 2026-09-17): the
+    base-teleport virtual joint is planar (x, y, yaw only), and a yaw
+    rotation about Z leaves any vector's Z-component unchanged, so the test
+    gives an identical answer in either frame - but link1 is always in the
+    TF tree, whereas world only exists while a BaseTeleporter happens to be
+    broadcasting. Using world here meant this raised LookupException in any
+    context without an active teleporter. It also matches the up-vector
+    reference live_capture.py records for the AnyGrasp side (see
+    write_capture_metadata / main.py --level-only), so both containers
+    select the same grasp.
+
+    Returns
+    -------
+    dict or None
+        The first (best-scoring) grasp meeting the tilt threshold, or
+        None if no candidate in `grasps` qualifies - try again with a
+        larger top_k from grasp_client.get_grasps(), or a larger
+        max_tilt_deg, rather than assuming no level grasp exists at all.
+    """
+
+    max_tilt_z = math.sin(math.radians(max_tilt_deg))
+
+    for grasp in grasps:
+        ref_pose = tf_utils.grasp_to_base_pose(
+            tf_buffer, grasp, base_frame=reference_frame, camera_frame=camera_frame,
+        )
+        approach = tf_utils.extract_approach_vector(ref_pose)
+        if abs(approach[2]) <= max_tilt_z:
+            return grasp
+
+    return None
 
 
 def plan_grasp_with_base_relocation(

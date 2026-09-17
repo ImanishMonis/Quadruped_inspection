@@ -23,11 +23,13 @@ the arm approach along the axis you'd expect, not sideways or
 backwards?) before trusting it for a real pick.
 """
 
+import threading
+
 import numpy as np
 import rospy
 import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  (registers PoseStamped transforms)
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf.transformations import (
     quaternion_from_matrix,
     quaternion_multiply,
@@ -42,7 +44,20 @@ from tf.transformations import (
 # RViz shows the arm approaching sideways/backwards, this is the one
 # constant to change (e.g. a +/-90 deg rotation about the axis that's
 # actually wrong).
-ROTATION_OFFSET_QUATERNION = (0.0, 0.0, 0.7071068, 0.7071068)
+#
+# Fixed 2026-09-17 (was a 90deg yaw about Z, not identity - a leftover
+# from an earlier, never-reconciled experiment, contradicting this
+# module's own docstring reasoning above). Verified computationally: that
+# 90deg-yaw offset maps local +X to world (0,1,0), meaning
+# quaternion_multiply(grasp_quat, offset)'s resulting local +X (what
+# extract_approach_vector reads) equalled the ORIGINAL grasp's local +Y -
+# i.e. AnyGrasp's CLOSING axis, not its approach axis. Every downstream
+# use of "approach direction" (base_teleport.compute_base_placement's
+# entire yaw/positioning logic) was silently working from the wrong axis,
+# which is what caused the base to teleport to an unrelated/opposite side
+# of the object relative to the actual grasp approach. See
+# AGENT_SESSION.md BUG-15.
+ROTATION_OFFSET_QUATERNION = (0.0, 0.0, 0.0, 1.0)
 
 DEFAULT_BASE_FRAME = "link1"
 DEFAULT_WORLD_FRAME = "world"
@@ -241,6 +256,72 @@ def offset_along_approach_axis(pose_stamped, distance):
     )
 
     return offset_pose
+
+
+class PoseBroadcaster:
+    """
+    Continuously re-broadcasts a set of named PoseStamped values as TF
+    frames, so they can be added in RViz (Add -> TF, or Add -> Axes with
+    the given frame name) and watched live against the real arm.
+
+    Added 2026-09-17 so executor.py can show the *actual* poses it just
+    computed and is acting on - not a separately re-run diagnostic that
+    might compute a different grasp if the scene/capture has moved on.
+    Each named pose gets its own persistent child frame (e.g. "grasp_pose",
+    "retreat_pose"); set_pose() updates one of them, and all currently-set
+    ones keep re-broadcasting at rate_hz until stop() is called.
+    """
+
+    def __init__(self, rate_hz=10.0):
+        self.rate_hz = rate_hz
+        self.broadcaster = tf2_ros.TransformBroadcaster()
+        self._poses = {}  # child_frame_id -> PoseStamped
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    def set_pose(self, child_frame_id, pose_stamped):
+        with self._lock:
+            self._poses[child_frame_id] = pose_stamped
+
+    def clear_pose(self, child_frame_id):
+        with self._lock:
+            self._poses.pop(child_frame_id, None)
+
+    def _broadcast_once(self):
+        with self._lock:
+            poses = dict(self._poses)
+
+        now = rospy.Time.now()
+        for child_frame_id, pose_stamped in poses.items():
+            t = TransformStamped()
+            t.header.stamp = now
+            t.header.frame_id = pose_stamped.header.frame_id
+            t.child_frame_id = child_frame_id
+            t.transform.translation.x = pose_stamped.pose.position.x
+            t.transform.translation.y = pose_stamped.pose.position.y
+            t.transform.translation.z = pose_stamped.pose.position.z
+            t.transform.rotation = pose_stamped.pose.orientation
+            self.broadcaster.sendTransform(t)
+
+    def _loop(self):
+        rate = rospy.Rate(self.rate_hz)
+        while self._running and not rospy.is_shutdown():
+            self._broadcast_once()
+            rate.sleep()
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
 
 if __name__ == "__main__":

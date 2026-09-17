@@ -34,6 +34,15 @@ import tf_utils
 # well away from singularities and joint pitch limits.
 DEFAULT_STANDOFF_DISTANCE = 0.22
 
+# Meters. See compute_base_placement's docstring - these bound the true
+# 3D distance to an elevated grasp, not just its horizontal component.
+# safe_max_reach is deliberately below the ~0.38m documented max reach:
+# a grasp at ~0.37m total distance timed out in practice (near-singular
+# configurations), so this leaves real margin rather than hugging the
+# documented limit.
+DEFAULT_SAFE_MAX_REACH = 0.32
+DEFAULT_MIN_STANDOFF = 0.12
+
 # Cache of latched Publishers, keyed by topic name.
 #
 # Added 2026-09-16 (BUG-17 investigation): both publish functions below
@@ -84,6 +93,8 @@ def compute_base_placement(
     standoff_distance=DEFAULT_STANDOFF_DISTANCE,
     current_base_pos=(0.0, 0.0),
     current_base_yaw=0.0,
+    safe_max_reach=DEFAULT_SAFE_MAX_REACH,
+    min_standoff=DEFAULT_MIN_STANDOFF,
 ):
     """
     Computes optimal base placement from a 6-DOF grasp pose in the world frame.
@@ -93,11 +104,31 @@ def compute_base_placement(
     grasp_pose_world : geometry_msgs.msg.PoseStamped or geometry_msgs.msg.Pose
         The target grasp pose expressed in the global world frame.
     standoff_distance : float
-        Horizontal distance (meters) between arm base (link1) and grasp center.
+        Max horizontal distance (meters) between arm base (link1) and grasp
+        center - used as-is for grasps near link1's own height, but shrunk
+        automatically for elevated grasps (see safe_max_reach below).
     current_base_pos : tuple of (float, float)
         Current (x, y) coordinates of the mobile base in the world frame.
     current_base_yaw : float
         Current heading angle (radians) of the mobile base in the world frame.
+    safe_max_reach : float
+        Meters. Added 2026-09-17 (found live: a grasp at Z=0.29m with the
+        fixed 0.22m standoff gave a *total* 3D distance of ~0.37m from
+        link1 - right at the arm's ~0.38m documented max reach - and
+        planning timed out. The fixed standoff only ever bounded the
+        horizontal (X/Y) distance, never the true 3D distance to an
+        elevated grasp. The effective standoff is now
+        sqrt(max(safe_max_reach**2 - z_relative**2, min_standoff**2)), so
+        it shrinks as height increases, keeping the true 3D distance
+        within this reach budget instead of silently growing past it.
+        Since base placement only ever changes (x, y, yaw) - never Z (the
+        SRDF's virtual_joint is planar, see AGENT_SESSION.md BUG-17) -
+        grasp_pose_world's own Z equals the grasp's height relative to
+        link1's origin directly, with no separate reference needed.
+    min_standoff : float
+        Meters. Floor on the shrunk standoff distance, so the base never
+        gets uncomfortably close to (or on top of) the object even for
+        very high grasps.
 
     Returns
     -------
@@ -106,7 +137,7 @@ def compute_base_placement(
         "relative_displacement": (dx_body, dy_body, dyaw_body)
         "approach_vector": np.ndarray [ax, ay, az]
         "is_top_down": bool
-        "standoff_distance": float
+        "standoff_distance": float (the actual, possibly-shrunk value used)
     """
     if hasattr(grasp_pose_world, "pose"):
         p = grasp_pose_world.pose.position
@@ -150,9 +181,20 @@ def compute_base_placement(
         diff2 = abs(normalize_angle(cand2 - current_base_yaw))
         target_base_yaw = cand1 if diff1 <= diff2 else cand2
 
+    # Shrink the horizontal standoff for elevated grasps so the true 3D
+    # distance from link1 stays within safe_max_reach - see
+    # compute_base_placement's docstring. pos[2] is the grasp's height
+    # relative to link1's own origin directly: base placement only ever
+    # changes (x, y, yaw), never Z.
+    z_relative = pos[2]
+    effective_standoff = min(
+        standoff_distance,
+        math.sqrt(max(safe_max_reach ** 2 - z_relative ** 2, min_standoff ** 2)),
+    )
+
     # Target base world position: placed behind grasp along approach heading
-    x_base = pos[0] - standoff_distance * math.cos(target_base_yaw)
-    y_base = pos[1] - standoff_distance * math.sin(target_base_yaw)
+    x_base = pos[0] - effective_standoff * math.cos(target_base_yaw)
+    y_base = pos[1] - effective_standoff * math.sin(target_base_yaw)
 
     # Relative displacement in world coordinates
     dx_world = x_base - current_base_pos[0]
@@ -172,6 +214,12 @@ def compute_base_placement(
         "[BasePlacement] Grasp world pos: (%.3f, %.3f, %.3f), approach: [%.2f, %.2f, %.2f]",
         pos[0], pos[1], pos[2], ax, ay, az
     )
+    if effective_standoff < standoff_distance - 1e-6:
+        rospy.loginfo(
+            "[BasePlacement] Standoff shrunk %.3fm -> %.3fm for elevated grasp "
+            "(z=%.3fm, safe_max_reach=%.3fm) to keep total 3D distance in reach.",
+            standoff_distance, effective_standoff, z_relative, safe_max_reach
+        )
     rospy.loginfo(
         "[BasePlacement] Target base world: (x=%.3f, y=%.3f, yaw=%.1f deg)",
         x_base, y_base, math.degrees(target_base_yaw)
@@ -186,7 +234,7 @@ def compute_base_placement(
         "relative_displacement": (float(dx_body), float(dy_body), float(dyaw_body)),
         "approach_vector": approach_vec,
         "is_top_down": is_top_down,
-        "standoff_distance": float(standoff_distance),
+        "standoff_distance": float(effective_standoff),
     }
 
 
