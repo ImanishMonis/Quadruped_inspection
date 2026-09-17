@@ -106,7 +106,23 @@ class AnyGraspDetector:
             "dense_grasp": False,
             "collision_detection":collision_detection,
             "region_steering":region_mask,
-            "approach_steering": [0.0, -1.0, 0.0],  # Camera forward view direction
+            # [0,-1,0] looked like a copy-paste from USAGE.md's generic
+            # example (matches its "all controls combined" snippet
+            # exactly), which briefly led to "fixing" this to [0,0,1] on
+            # 2026-09-17, reasoning from the deprojection math alone
+            # (textbook pinhole -> +Z forward). Reverted: the user had
+            # already empirically validated [0,-1,0] - setting it to
+            # [0,-1,0] visibly produces grasps approaching from the front
+            # of the object, confirmed by watching real captures, which
+            # is stronger evidence than the formula-based assumption.
+            # This means the *actual* effective forward axis for this
+            # camera's real published data is -Y, not the +Z the pinhole
+            # formula alone would suggest - i.e. something about the live
+            # depth image's actual row/column layout or how Isaac Sim
+            # publishes it doesn't match the naive textbook assumption.
+            # Not yet root-caused - see AGENT_SESSION.md. Don't "fix" this
+            # back to [0,0,1] without re-validating empirically first.
+            "approach_steering": [0.0, -1.0, 0.0],
             "approach_thresh": np.pi / 4,
         }
 
@@ -125,6 +141,21 @@ class AnyGraspDetector:
 
         grasps = grasps.sort_by_score()
 
+        # filter_parallel_grasps() disabled 2026-09-17: it crashed every
+        # request (IndexError: tuple index out of range, from
+        # `grasps[valid_indices]` - GraspGroup only reliably supports
+        # single-int indexing and slicing, not a list of indices). It also
+        # had the axis backwards (indexed row 0 when it meant column 0,
+        # and even column 0 is this codebase's APPROACH axis, not the
+        # "closing direction" the docstring claimed - see tf_utils.py) and
+        # used a fixed camera-frame ground_normal, which only holds for
+        # one specific camera pose since the camera moves with the arm.
+        # "Parallel to the ground" now belongs entirely to the client
+        # side instead: grasp_pipeline/grasp_planner.select_level_grasp()
+        # correctly uses the approach axis, transforms into the WORLD
+        # frame via live TF, and is tunable per-call
+        # (--max-tilt-deg/--top-k in executor.py). See AGENT_SESSION.md.
+        # grasps = filter_parallel_grasps(grasps)
 
         if len(grasps) == 0:
             return None
@@ -162,3 +193,35 @@ class AnyGraspDetector:
         grasps = grasps.nms()
 
         return grasps.sort_by_score()
+
+
+def filter_parallel_grasps(grasps, max_tilt_deg=10.0, ground_normal=np.array([0.0, 0.0, 1.0])):
+    """
+    Filters grasps so the gripper closing direction (R[:, 0]) is parallel to the ground.
+    
+    ground_normal: [0, -1, 0] in standard camera frame (+Y points down, so -Y points up).
+    max_tilt_deg: Maximum allowed angle (in degrees) off the horizontal ground plane.
+    """
+    if grasps is None or len(grasps) == 0:
+        return grasps
+
+    # Normalize ground vector
+    ground_normal = ground_normal / np.linalg.norm(ground_normal)
+    max_allowed_vertical = np.sin(np.radians(max_tilt_deg))
+
+    valid_indices = []
+    for i in range(len(grasps)):
+        # Column 0 is the finger closing direction vector
+        closing_axis = grasps[i].rotation_matrix[0, :]
+        
+        # Absolute dot product measures vertical component (0 = perfectly horizontal)
+        vertical_comp = abs(np.dot(closing_axis, ground_normal))
+        
+        if vertical_comp <= max_allowed_vertical:
+            valid_indices.append(i)
+
+    if len(valid_indices) == 0:
+        print("[Warning] No grasps passed the parallel filter! Returning top unfiltered grasp.")
+        return grasps
+
+    return grasps[valid_indices]
