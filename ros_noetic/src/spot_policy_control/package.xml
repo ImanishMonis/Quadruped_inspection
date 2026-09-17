@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>spot_policy_control</name>
+  <version>1.0.0</version>
+  <description>
+    ROS interface and Isaac Sim built-in RL policy controller for Boston Dynamics Spot,
+    supporting velocity commands, joint state publishing, and arm-mounting readiness.
+  </description>
+
+  <maintainer email="monisi1@todo.todo">monisi1</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+  </export>
+</package>

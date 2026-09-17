@@ -1,0 +1,12 @@
+<launch>
+  <!-- Arguments -->
+  <arg name="cmd_topic" default="/cmd_vel" />
+  <arg name="launch_teleop" default="false" />
+
+  <!-- Optional Teleop node -->
+  <group if="">
+    <node pkg="spot_policy_control" type="spot_teleop.py" name="spot_teleop" output="screen">
+      <param name="topic" value="" />
+    </node>
+  </group>
+</launch>

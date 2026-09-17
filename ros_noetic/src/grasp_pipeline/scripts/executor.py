@@ -15,10 +15,12 @@ Group/state names come straight from config/open_manipulator_x.srdf:
     end_effector : parent_link="end_effector_link", group="hand"
 """
 
+import math
 import rospy
 import moveit_commander
 import tf2_ros
 
+import base_teleport
 import grasp_planner
 import tf_utils
 
@@ -68,6 +70,10 @@ def execute_pick(
     object_name=None,
     pregrasp_offset=grasp_planner.DEFAULT_PREGRASP_OFFSET,
     retreat_offset=DEFAULT_RETREAT_OFFSET,
+    standoff_distance=base_teleport.DEFAULT_STANDOFF_DISTANCE,
+    base_topic=base_teleport.DEFAULT_GO1_TOPIC,
+    teleport_base=True,
+    teleporter=None,
     planning_time=10.0,
     planning_attempts=10,
 ):
@@ -82,43 +88,52 @@ def execute_pick(
         One grasp as returned by grasp_client.get_grasps()/get_best_grasp().
     object_name : str, optional
         Planning-scene object name to attach after closing the gripper.
-        If None, the attach step is skipped (nothing published the
-        object into the planning scene yet - see scene_receiver.py).
+    standoff_distance : float
+        Horizontal distance between arm base and grasp center (meters).
+    base_topic : str
+        ROS topic to publish Go1 relative displacement commands to.
+    teleport_base : bool
+        Whether to calculate and teleport the arm base in simulation / TF.
+    teleporter : BaseTeleporter, optional
+        Active BaseTeleporter instance for dynamic TF broadcasting.
 
     Raises
     ------
     PickExecutionError
-        On any step failing. Earlier steps are not undone - the arm is
-        left wherever it stopped, deliberately, so the failure is
-        visible instead of silently retreating.
+        On any step failing. Earlier steps are not undone.
     """
-
-    # A short default planning time/attempt count is what leaves a 4-DOF
-    # arm timing out on legitimately-reachable-but-tight grasp poses -
-    # set generous values regardless of what the caller configured.
     arm.set_planning_time(planning_time)
     arm.set_num_planning_attempts(planning_attempts)
 
-    pregrasp_pose, grasp_pose = grasp_planner.plan_grasp_poses(
+    pregrasp_pose, grasp_pose, base_info = grasp_planner.plan_grasp_poses(
         tf_buffer,
         grasp,
         pregrasp_offset=pregrasp_offset,
+        teleport_base=teleport_base,
+        standoff_distance=standoff_distance,
+        base_topic=base_topic,
+        teleporter=teleporter,
+        return_base_info=True,
     )
-    print("*" * 15)
-    print(grasp_pose)
-    print(f"Target X: {grasp_pose.pose.position.x:.4f}")
-    print(f"Target Y: {grasp_pose.pose.position.y:.4f}")
-    print(f"Target Z: {grasp_pose.pose.position.z:.4f}")
-    print(f"Radial Distance: {(grasp_pose.pose.position.x**2 + grasp_pose.pose.position.y**2)**0.5:.4f}")
-    print("*" * 15)
 
-    # retreat_pose = tf_utils.offset_along_approach_axis(
-    #     grasp_pose,
-    #     retreat_offset,
-    # )
-    # GRIPPER_LENGTH = 0.13 
-    # grasp_pose = tf_utils.offset_along_approach_axis(grasp_pose, GRIPPER_LENGTH)
-    # pregrasp_pose = tf_utils.offset_along_approach_axis(pregrasp_pose, GRIPPER_LENGTH)
+    if base_info is not None:
+        dx, dy, dtheta = base_info["relative_displacement"]
+        bx, by, byaw = base_info["target_base_world"]
+        rospy.loginfo("=" * 50)
+        rospy.loginfo("[BaseRelocation] Unitree Go1 Base Teleportation Parameters:")
+        rospy.loginfo("  Target World Pose : x=%.4f m, y=%.4f m, yaw=%.2f deg", bx, by, math.degrees(byaw))
+        rospy.loginfo("  Command (Pose2D)  : delta_x=%.4f m, delta_y=%.4f m, delta_yaw=%.2f deg", dx, dy, math.degrees(dtheta))
+        rospy.loginfo("  Published to topic: %s", base_topic)
+        rospy.loginfo("=" * 50)
+
+    print("*" * 20)
+    print("Planned Grasp in Teleported Arm Frame (link1):")
+    print(f"Target X: {grasp_pose.pose.position.x:.4f} m")
+    print(f"Target Y: {grasp_pose.pose.position.y:.4f} m")
+    print(f"Target Z: {grasp_pose.pose.position.z:.4f} m")
+    print(f"Radial Distance: {(grasp_pose.pose.position.x**2 + grasp_pose.pose.position.y**2)**0.5:.4f} m")
+    print(f"Orientation (quat): [{grasp_pose.pose.orientation.x:.3f}, {grasp_pose.pose.orientation.y:.3f}, {grasp_pose.pose.orientation.z:.3f}, {grasp_pose.pose.orientation.w:.3f}]")
+    print("*" * 20)
 
     # 1. Open gripper before moving anywhere near the object.
     hand.set_named_target(GRIP_OPEN_STATE)
@@ -126,45 +141,48 @@ def execute_pick(
         raise PickExecutionError("Failed to open gripper")
     hand.stop()
 
-    # 2. Move to the pre-grasp waypoint (free planning, not cartesian -
-    #    this leg can be far from the object, cartesian is only needed
-    #    for the final straight-line approach in step 3).
-    # arm.set_pose_target(pregrasp_pose)
-    # if not arm.go(wait=True):
-    #     raise PickExecutionError("Failed to reach pre-grasp pose")
-    # arm.stop()
-    # arm.clear_pose_targets()
-
-    # arm.set_position_target([
-    #     pregrasp_pose.pose.position.x, 
-    #     pregrasp_pose.pose.position.y, 
-    #     pregrasp_pose.pose.position.z
-    # ])
-    # if not arm.go(wait=True):
-    #     raise PickExecutionError("Failed to reach pre-grasp pose")
-    # arm.stop()
-    # arm.clear_pose_targets()
-
-    # 3. Straight-line cartesian approach from pre-grasp into the grasp.
-    # _run_cartesian_path(
-    #     arm,
-    #     [pregrasp_pose.pose, grasp_pose.pose],
-    #     description="grasp approach",
-    # )
-
-    arm.set_position_target([
-        grasp_pose.pose.position.x, 
-        grasp_pose.pose.position.y, 
-        grasp_pose.pose.position.z
-    ])
-    # arm.set_position_target([
-    #     0.2632,-0.0355,0.0627
-    # ])
-
-    if not arm.go(wait=True):
-        raise PickExecutionError("Failed to reach grasp pose")
+    # 2. Move to pre-grasp waypoint with full orientation
+    # Since the mobile base moved behind the grasp approach direction,
+    # the grasp approach axis aligns with the arm's sagittal plane.
+    arm.set_pose_target(pregrasp_pose)
+    reached = arm.go(wait=True)
+    if not reached:
+        rospy.logwarn(
+            "Free-space 6D pose planning to pre-grasp failed; "
+            "attempting position target with current pitch alignment..."
+        )
+        arm.clear_pose_targets()
+        arm.set_position_target([
+            pregrasp_pose.pose.position.x,
+            pregrasp_pose.pose.position.y,
+            pregrasp_pose.pose.position.z,
+        ])
+        if not arm.go(wait=True):
+            raise PickExecutionError("Failed to reach pre-grasp pose")
     arm.stop()
     arm.clear_pose_targets()
+
+    # 3. Straight-line cartesian approach from pre-grasp into the grasp
+    try:
+        _run_cartesian_path(
+            arm,
+            [pregrasp_pose.pose, grasp_pose.pose],
+            description="grasp approach",
+        )
+    except Exception as exc:
+        rospy.logwarn("Cartesian approach failed (%s); trying direct pose target...", exc)
+        arm.set_pose_target(grasp_pose)
+        if not arm.go(wait=True):
+            arm.clear_pose_targets()
+            arm.set_position_target([
+                grasp_pose.pose.position.x,
+                grasp_pose.pose.position.y,
+                grasp_pose.pose.position.z,
+            ])
+            if not arm.go(wait=True):
+                raise PickExecutionError("Failed to reach grasp pose")
+        arm.stop()
+        arm.clear_pose_targets()
 
     # 4. Close the gripper on the object.
     hand.set_named_target(GRIP_CLOSE_STATE)
@@ -182,23 +200,26 @@ def execute_pick(
         )
 
     # 6. Straight-line retreat.
-    # _run_cartesian_path(
-    #     arm,
-    #     [grasp_pose.pose, retreat_pose.pose],
-    #     description="retreat",
-    # )
-    arm.set_position_target([
-        0.138, 
-        0.00, 
-        0.167
-    ])
-    if not arm.go(wait=True):
-        raise PickExecutionError("Failed to retreat")
+    retreat_pose = tf_utils.offset_along_approach_axis(
+        grasp_pose,
+        retreat_offset,
+    )
+    try:
+        _run_cartesian_path(
+            arm,
+            [grasp_pose.pose, retreat_pose.pose],
+            description="retreat",
+        )
+    except Exception:
+        arm.set_position_target([
+            retreat_pose.pose.position.x,
+            retreat_pose.pose.position.y,
+            retreat_pose.pose.position.z,
+        ])
+        arm.go(wait=True)
     arm.stop()
     arm.clear_pose_targets()
 
-
- 
     return True
 # def execute_pick(
 #     arm,
@@ -323,6 +344,18 @@ if __name__ == "__main__":
     parser.add_argument("--object-name", default=None,
                          help="planning-scene object name to attach; "
                               "omit to skip the attach step")
+    parser.add_argument("--teleport", action="store_true", default=True,
+                         help="Enable mobile base relocation and arm base teleportation")
+    parser.add_argument("--no-teleport", dest="teleport", action="store_false",
+                         help="Disable mobile base relocation (fixed base mode)")
+    parser.add_argument("--standoff-dist", type=float,
+                         default=base_teleport.DEFAULT_STANDOFF_DISTANCE,
+                         help="Horizontal distance from base to grasp center (m)")
+    parser.add_argument("--base-topic", type=str,
+                         default=base_teleport.DEFAULT_GO1_TOPIC,
+                         help="ROS topic for Unitree Go1 displacement command")
+    parser.add_argument("--teleport-only", action="store_true", default=False,
+                         help="Only compute base placement, publish command and teleport without executing arm motion")
     args = parser.parse_args(rospy.myargv(sys.argv[1:]))
 
     moveit_commander.roscpp_initialize(sys.argv)
@@ -331,6 +364,11 @@ if __name__ == "__main__":
     tf_buffer = tf2_ros.Buffer()
     tf2_ros.TransformListener(tf_buffer)
     rospy.sleep(1.0)
+
+    teleporter = None
+    if args.teleport:
+        teleporter = base_teleport.BaseTeleporter(rate_hz=20.0)
+        teleporter.start()
 
     arm = moveit_commander.MoveGroupCommander(ARM_GROUP)
     hand = moveit_commander.MoveGroupCommander(HAND_GROUP)
@@ -343,7 +381,28 @@ if __name__ == "__main__":
 
     if grasp is None:
         rospy.logerr("No grasp returned, nothing to execute.")
+        if teleporter:
+            teleporter.stop()
         raise SystemExit(1)
+
+    if args.teleport_only:
+        rospy.loginfo("Teleport-only mode: computing base placement and publishing...")
+        pregrasp_pose, grasp_pose, base_info = grasp_planner.plan_grasp_poses(
+            tf_buffer,
+            grasp,
+            pregrasp_offset=args.pregrasp_offset,
+            teleport_base=True,
+            standoff_distance=args.standoff_dist,
+            base_topic=args.base_topic,
+            teleporter=teleporter,
+            return_base_info=True,
+        )
+        rospy.loginfo("Teleportation complete. Waiting for mobile base execution.")
+        rospy.sleep(1.0)
+        if teleporter:
+            teleporter.stop()
+        moveit_commander.roscpp_shutdown()
+        sys.exit(0)
 
     try:
         execute_pick(
@@ -354,10 +413,19 @@ if __name__ == "__main__":
             object_name=args.object_name,
             pregrasp_offset=args.pregrasp_offset,
             retreat_offset=args.retreat_offset,
+            standoff_distance=args.standoff_dist,
+            base_topic=args.base_topic,
+            teleport_base=args.teleport,
+            teleporter=teleporter,
         )
         rospy.loginfo("Pick sequence completed.")
     except PickExecutionError as exc:
         rospy.logerr("Pick sequence failed: %s", exc)
+        if teleporter:
+            teleporter.stop()
         raise SystemExit(1)
+    finally:
+        if teleporter:
+            teleporter.stop()
 
     moveit_commander.roscpp_shutdown()

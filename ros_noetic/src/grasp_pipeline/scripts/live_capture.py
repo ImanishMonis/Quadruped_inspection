@@ -20,14 +20,27 @@ Isaac Sim's simulated depth is 32FC1 (already in meters, depth_scale=1
 - verified against the live topic before writing this).
 
 Object mask: there is no real object-selection mechanism here (that's
-WP1's job - a teammate's GUI - and doesn't exist in this repo). This
-script uses a configurable axis-aligned workspace bounding box in the
-camera's optical frame as an explicit stand-in, following the same
-pattern AnyGrasp's own USAGE.md documents for workspace filtering.
-Replace DEFAULT_OBJECT_BOX (or pass --box-x/--box-y/--box-z) once a
-real selection mechanism exists, and check it against your actual scene
-first - see the module's __main__ for a --dump-stats mode to inspect
-the raw point cloud's extent before picking box bounds blindly.
+WP1's job - a teammate's GUI - and doesn't exist in this repo). Previously
+this used a configurable axis-aligned workspace bounding box (x/y/z) in
+the camera's optical frame as an explicit stand-in. Replaced 2026-09-17
+with a plain depth-range (Z only) filter, per the user's request - anything
+between OBJECT_MIN_DEPTH and OBJECT_MAX_DEPTH counts as "object", full
+stop, no X/Y windowing. Still just a placeholder for WP1's real selection,
+now a simpler one.
+
+Note on sparsity (found live, 2026-09-17): if the captured cloud looks far
+too sparse regardless of this filter, check --dump-stats's raw point
+count and the underlying depth image's finite-pixel mean BEFORE assuming
+this script's logic is at fault. A live diagnostic that day found the
+raw depth image was ~87% finite, but the finite mean was ~0.01m -
+essentially identical to MIN_DEPTH's near-clip cutoff - meaning the vast
+majority of "finite" pixels were near-clip/no-hit noise (almost certainly
+the robot's own gripper/arm filling most of the frame), correctly
+discarded by MIN_DEPTH, leaving very few genuine scene points. That's an
+observe-pose/framing problem (matches session 3's near-identical incident,
+see AGENT_SESSION.md), not a bug in the deprojection or filtering here -
+narrowing the depth range further cannot manufacture points that were
+never captured. Reposition the arm/camera for real clearance first.
 """
 
 import numpy as np
@@ -41,15 +54,11 @@ CAMERA_INFO_TOPIC = "/camera/color/camera_info"
 MIN_DEPTH = 0.12   # meters; discard anything closer (near-clip/self-body noise)
 MAX_DEPTH = 2.0    # meters; discard anything farther (background/no-return)
 
-# Axis-aligned box in the camera's optical frame (x right, y down,
-# z forward), meters. Placeholder for WP1's real object selection -
-# see module docstring. These defaults are NOT verified against any
-# particular scene - check with --dump-stats first.
-DEFAULT_OBJECT_BOX = {
-    "x": (-0.15, 0.15),
-    "y": (-0.15, 0.15),
-    "z": (0.1, 0.5),
-}
+# Depth range (Z only, camera optical frame) counted as "object" -
+# replaces the old axis-aligned box. Still a placeholder for WP1's real
+# object selection - see module docstring.
+OBJECT_MIN_DEPTH = 0.10  # meters
+OBJECT_MAX_DEPTH = 1.0   # meters
 
 
 def get_depth_and_intrinsics(depth_topic=DEPTH_TOPIC,
@@ -106,24 +115,14 @@ def deproject(depth, intrinsics, min_depth=MIN_DEPTH, max_depth=MAX_DEPTH):
     return np.stack([x, y, z], axis=1).astype(np.float32)
 
 
-def apply_workspace_box(points, box=None):
+def apply_depth_range(points, min_depth=OBJECT_MIN_DEPTH, max_depth=OBJECT_MAX_DEPTH):
     """
-    Boolean mask: True for points inside the axis-aligned box.
-    Placeholder for real object selection - see module docstring.
+    Boolean mask: True for points whose Z (camera-forward depth) falls
+    within [min_depth, max_depth]. Placeholder for real object selection -
+    see module docstring. Replaces the old axis-aligned X/Y/Z box.
     """
 
-    if box is None:
-        box = DEFAULT_OBJECT_BOX
-
-    xmin, xmax = box["x"]
-    ymin, ymax = box["y"]
-    zmin, zmax = box["z"]
-
-    return (
-        (points[:, 0] >= xmin) & (points[:, 0] <= xmax)
-        & (points[:, 1] >= ymin) & (points[:, 1] <= ymax)
-        & (points[:, 2] >= zmin) & (points[:, 2] <= zmax)
-    )
+    return (points[:, 2] >= min_depth) & (points[:, 2] <= max_depth)
 
 
 def write_pcd(path, points):
@@ -155,13 +154,15 @@ def write_pcd(path, points):
             f.write(f"{x} {y} {z}\n")
 
 
-def capture_scene_and_object(scene_path, object_path, box=None,
+def capture_scene_and_object(scene_path, object_path,
+                              min_depth=OBJECT_MIN_DEPTH,
+                              max_depth=OBJECT_MAX_DEPTH,
                               depth_topic=DEPTH_TOPIC,
                               camera_info_topic=CAMERA_INFO_TOPIC):
     """
     Captures one frame, writes scene_path (full point cloud) and
-    object_path (points inside `box`) as .pcd files. Returns
-    (scene_points, object_points, frame_id) for convenience.
+    object_path (points with min_depth <= Z <= max_depth) as .pcd files.
+    Returns (scene_points, object_points, frame_id) for convenience.
     """
 
     depth, intrinsics, frame_id = get_depth_and_intrinsics(
@@ -176,19 +177,23 @@ def capture_scene_and_object(scene_path, object_path, box=None,
             "is anything within MIN_DEPTH/MAX_DEPTH of the camera?"
         )
 
-    object_mask = apply_workspace_box(scene_points, box)
-    # object_points = scene_points[object_mask]
-    object_points = scene_points
-    
+    # Fixed 2026-09-17: this used to compute object_mask and then
+    # immediately discard it (`object_points = scene_points` unconditionally,
+    # with the masked line commented out) - object.pcd had been a plain
+    # copy of scene.pcd this whole time, box or no box. Now actually applied.
+    object_mask = apply_depth_range(scene_points, min_depth, max_depth)
+    object_points = scene_points[object_mask]
+
     rospy.loginfo(
-        "Captured %d scene points, %d in the object box (frame: %s)",
-        scene_points.shape[0], object_points.shape[0], frame_id,
+        "Captured %d scene points, %d in depth range [%.2f, %.2f]m (frame: %s)",
+        scene_points.shape[0], object_points.shape[0], min_depth, max_depth, frame_id,
     )
 
     if object_points.shape[0] == 0:
         rospy.logwarn(
-            "Object box selected 0 points - check the box bounds against "
-            "where the object actually is in %s (--dump-stats can help).",
+            "Depth-range filter selected 0 points - check min_depth/"
+            "max_depth against where the object actually is in %s "
+            "(--dump-stats can help).",
             frame_id,
         )
 
@@ -208,27 +213,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--scene-out", default="/tmp/live_scene.pcd")
     parser.add_argument("--object-out", default="/tmp/live_object.pcd")
-    parser.add_argument("--box-x", type=float, nargs=2,
-                         default=DEFAULT_OBJECT_BOX["x"])
-    parser.add_argument("--box-y", type=float, nargs=2,
-                         default=DEFAULT_OBJECT_BOX["y"])
-    parser.add_argument("--box-z", type=float, nargs=2,
-                         default=DEFAULT_OBJECT_BOX["z"])
+    parser.add_argument("--object-min-depth", type=float,
+                         default=OBJECT_MIN_DEPTH)
+    parser.add_argument("--object-max-depth", type=float,
+                         default=OBJECT_MAX_DEPTH)
     parser.add_argument(
         "--dump-stats", action="store_true",
         help="Print the captured cloud's per-axis min/max/percentiles "
-             "and exit without writing files - use this FIRST to pick "
-             "sane --box-x/--box-y/--box-z bounds for your actual scene.",
+             "and exit without writing files - use this FIRST to check "
+             "the raw point count/extent before assuming a sparse result "
+             "is a bug rather than a framing/observe-pose problem, and to "
+             "pick sane --object-min-depth/--object-max-depth for your "
+             "actual scene.",
     )
     args = parser.parse_args()
 
     rospy.init_node("live_capture", anonymous=True)
-
-    box = {
-        "x": tuple(args.box_x),
-        "y": tuple(args.box_y),
-        "z": tuple(args.box_z),
-    }
 
     if args.dump_stats:
         depth, intrinsics, frame_id = get_depth_and_intrinsics()
@@ -243,7 +243,8 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     capture_scene_and_object(
-        args.scene_out, args.object_out, box=box
+        args.scene_out, args.object_out,
+        min_depth=args.object_min_depth, max_depth=args.object_max_depth,
     )
 
     rospy.loginfo("Wrote %s and %s", args.scene_out, args.object_out)

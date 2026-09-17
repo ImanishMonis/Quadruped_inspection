@@ -46,7 +46,18 @@
     <!-- <end_effector name="hand" parent_link="end_effector_link" group="hand"/> -->
      <end_effector name="hand" parent_link="link5" group="hand" parent_group="x_arm"/>
     <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
-    <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="link1"/>
+    <!-- type changed fixed -> planar (2026-09-16): a fixed virtual joint is
+         baked into MoveIt's robot model once at load time and never
+         re-read from TF, so grasp_pipeline/base_teleport.py's dynamic
+         world->link1 broadcast (meant to relocate the arm base for a
+         grasp) was silently ignored during planning no matter what TF
+         said. planar (x, y, yaw) makes MoveIt's CurrentStateMonitor pull
+         this transform live from TF instead - matches the corresponding
+         URDF change (world_fixed joint removed, see
+         open_manipulator_x.urdf.xacro) and BaseTeleporter's own
+         parent_frame="world"/child_frame="link1" defaults, no code
+         change needed there. See AGENT_SESSION.md BUG-17. -->
+    <virtual_joint name="virtual_joint" type="planar" parent_frame="world" child_link="link1"/>
     <!--DISABLE COLLISIONS: By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->
     <disable_collisions link1="gripper_left_link" link2="gripper_right_link" reason="Never"/>
     <disable_collisions link1="gripper_left_link" link2="link4" reason="Never"/>

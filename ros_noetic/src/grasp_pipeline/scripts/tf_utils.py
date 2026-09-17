@@ -45,6 +45,7 @@ from tf.transformations import (
 ROTATION_OFFSET_QUATERNION = (0.0, 0.0, 0.7071068, 0.7071068)
 
 DEFAULT_BASE_FRAME = "link1"
+DEFAULT_WORLD_FRAME = "world"
 DEFAULT_CAMERA_FRAME = "camera_optical_frame"
 
 # Empirical correction for a residual mount-offset mismatch between the
@@ -152,6 +153,64 @@ def grasp_to_base_pose(
     base_pose.pose.position.y += GRASP_POSITION_CORRECTION[1]
     base_pose.pose.position.z += GRASP_POSITION_CORRECTION[2]
     return base_pose
+
+
+def grasp_to_world_pose(
+    tf_buffer,
+    grasp,
+    world_frame=DEFAULT_WORLD_FRAME,
+    camera_frame=DEFAULT_CAMERA_FRAME,
+):
+    """
+    Transform AnyGrasp grasp directly into the world coordinate frame.
+    """
+    camera_pose = grasp_to_camera_pose(grasp, frame_id=camera_frame)
+    world_pose = transform_pose(tf_buffer, camera_pose, world_frame)
+
+    world_pose.pose.position.x += GRASP_POSITION_CORRECTION[0]
+    world_pose.pose.position.y += GRASP_POSITION_CORRECTION[1]
+    world_pose.pose.position.z += GRASP_POSITION_CORRECTION[2]
+    return world_pose
+
+
+def extract_approach_vector(pose_or_quat):
+    """
+    Extracts the local +X approach vector in the frame of the orientation.
+    Accepts PoseStamped, Pose, Quaternion, or [x, y, z, w].
+    """
+    if hasattr(pose_or_quat, "pose"):
+        q = pose_or_quat.pose.orientation
+        quat = [q.x, q.y, q.z, q.w]
+    elif hasattr(pose_or_quat, "orientation"):
+        q = pose_or_quat.orientation
+        quat = [q.x, q.y, q.z, q.w]
+    elif hasattr(pose_or_quat, "x"):
+        quat = [pose_or_quat.x, pose_or_quat.y, pose_or_quat.z, pose_or_quat.w]
+    else:
+        quat = list(pose_or_quat)
+
+    rot = quaternion_matrix(quat)
+    return rot[:3, 0]
+
+
+def extract_closing_vector(pose_or_quat):
+    """
+    Extracts the local +Y closing vector in the frame of the orientation.
+    Accepts PoseStamped, Pose, Quaternion, or [x, y, z, w].
+    """
+    if hasattr(pose_or_quat, "pose"):
+        q = pose_or_quat.pose.orientation
+        quat = [q.x, q.y, q.z, q.w]
+    elif hasattr(pose_or_quat, "orientation"):
+        q = pose_or_quat.orientation
+        quat = [q.x, q.y, q.z, q.w]
+    elif hasattr(pose_or_quat, "x"):
+        quat = [pose_or_quat.x, pose_or_quat.y, pose_or_quat.z, pose_or_quat.w]
+    else:
+        quat = list(pose_or_quat)
+
+    rot = quaternion_matrix(quat)
+    return rot[:3, 1]
 
 
 def offset_along_approach_axis(pose_stamped, distance):

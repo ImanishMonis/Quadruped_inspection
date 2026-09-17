@@ -24,7 +24,16 @@
   <arg name="use_rviz" default="true" />
 
   <!-- If needed, broadcast static tf for robot root -->
-  <node pkg="tf2_ros" type="static_transform_publisher" name="virtual_joint_broadcaster_0" args="0 0 0 0 0 0 world link1" />
+  <!-- Commented out (2026-09-16): grasp_pipeline/base_teleport.py's BaseTeleporter also
+       publishes world -> link1 (a dynamic broadcast, moved to place the arm base near a
+       computed grasp pose). Two broadcasters for the same TF edge race each other, and this
+       static one was winning lookups - grasp_planner.py's "Planned Grasp in Teleported Arm
+       Frame" kept coming back identical to the raw world-frame grasp pose (radial distance
+       ~1.4m, from an arm with ~0.38m reach), because it was reading this identity transform
+       instead of BaseTeleporter's teleported one. Re-enable this only if base_teleport.py's
+       teleportation is disabled (e.g. executor.py's no_teleport option) and nothing else is
+       publishing world -> link1. -->
+  <!-- <node pkg="tf2_ros" type="static_transform_publisher" name="virtual_joint_broadcaster_0" args="0 0 0 0 0 0 world link1" /> -->
 
   <group if="$(eval arg('moveit_controller_manager') == 'fake')">
     <!-- We do not have a real robot connected, so publish fake joint states via a joint_state_publisher
