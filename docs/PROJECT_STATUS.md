@@ -4,7 +4,7 @@
 **Supervisor:** Niklas Mueller-Goldingen
 **Work package:** WP3 — Grasp pose estimation, MoveIt planning, execution
 **Platform:** ROBOTIS OpenManipulator-X (4-DOF) + Intel RealSense D455, validated in Isaac Sim 4.5
-**Last updated:** 2026-09-17
+**Last updated:** 2026-09-20
 
 ---
 
@@ -62,6 +62,7 @@ ros_noetic/src/
     grasp_planner.py               grasp/pre-grasp pose computation, grasp selection
     base_teleport.py               mobile-base placement for out-of-reach grasps
     executor.py                    full pick sequence through MoveIt
+    multi_view_capture.py          multi-view point-cloud capture (left/right/top/close)
     isaac_sim_teleport_listener.py runs inside Isaac Sim, relocates the robot
   X_moveit_config/                 MoveIt configuration (URDF/SRDF, planners, launch)
   moveit_isaac_controller_manager/ MoveIt → Isaac Sim controller plugin
@@ -86,7 +87,7 @@ docs/
 |---|---|
 | Point-cloud capture from simulated camera | Working |
 | AnyGrasp inference service (REST) | Working |
-| Grasp transformation into robot frame | Working, verified numerically |
+| Grasp transformation into robot frame | Working, verified numerically (camera-mount rotation fixed this session, see §6) |
 | Grasp selection (best-score, or "parallel to ground" filter) | Working |
 | Mobile-base placement computation | Working, height-aware |
 | MoveIt planning and execution | Working |
@@ -110,13 +111,20 @@ docs/
    reached the target. Joint states must be checked independently to confirm a move. Replacing this
    with a proper `FollowJointTrajectory` action server is the correct fix.
 
-3. **Camera mount calibration.** The camera transform in the URDF is an assumed value that has not
-   been reconciled against the actual camera placement in the Isaac Sim scene; a residual position
-   error remains.
+3. ~~**Camera mount calibration.**~~ **Resolved this session (BUG-20).** The camera's *position*
+   mount offset was already correct; the *rotation* (`camera_optical_joint`) was missing a 90° roll,
+   which silently turned a real object's vertical offset from the optical axis into a spurious
+   lateral offset in the robot's frame. Fixed and verified live against a known object position,
+   both centred and off-centre.
 
-4. **Physical base relocation in simulation is unverified.** The base-placement computation works,
-   and a script exists to move the robot in Isaac Sim accordingly, but it has not yet been confirmed
-   working against a live scene.
+4. **Physical base relocation in simulation is verified for grasp execution, but a related
+   multi-view fusion frame bug was found and fixed.** `executor.py --teleport`'s base relocation
+   works. Separately, `isaac_sim_native_gui.py` (the multi-view capture GUI, teammate's repo) used
+   the wrong "fixed" reference prim for reporting camera poses — one that itself gets teleported
+   during multi-view capture — which silently cancelled out the base relocation in every recorded
+   pose. Fixed by switching to a prim that's actually fixed (`/FlatGrid`); **not yet re-verified**
+   with the diagnostic tool (`sam2_service/refine_session_poses.py --dry-run`) after the fix — do
+   that first next session.
 
 ---
 
@@ -135,6 +143,7 @@ cases where every printed value looked correct while the robot physically moved 
 | Straight-line (Cartesian) approach always failed | The arm is 4-DOF and uses position-only IK, so it cannot satisfy the orientation constraints a Cartesian path requires. Replaced with a direct position target. |
 | Point clouds were extremely sparse | Not a software fault — the arm pose put the gripper in front of the camera, so most of the frame was near-clip noise. Identified by inspecting the raw depth image directly. |
 | AnyGrasp service returned HTTP 500 on every request | A grasp-filtering function indexed the SDK's grasp container with a list, which it does not support. Disabled it in favour of filtering on the ROS side, where the world orientation is actually known. |
+| A centred object still produced a nonzero lateral (Y) grasp offset | `camera_optical_joint`'s rotation was missing a 90° roll, so the camera's real vertical offset from an object was injected as a lateral offset in the robot's frame. Two paper derivations of the correct rotation were tried and both were wrong when tested live (one made the error larger); fixed by printing the raw, untransformed camera-frame translation and solving directly against a known object position. Verified for both a centred and an off-centre object. |
 
 A full engineering log with reproduction steps for each is maintained in `AGENT_SESSION.md`.
 
@@ -144,8 +153,9 @@ A full engineering log with reproduction steps for each is maintained in `AGENT_
 
 1. Verify a complete, successful pick of the object in simulation, confirming arrival from joint
    states rather than command return values.
-2. Add a reachability check that rejects unreachable grasp candidates before planning.
-3. Replace the open-loop controller with a `FollowJointTrajectory` action server.
-4. Reconcile the camera mount transform against the actual Isaac Sim scene.
+2. Re-run `sam2_service/refine_session_poses.py --dry-run` on a fresh multi-view session to confirm
+   the `WORLD_FRAME_PRIM` fusion-frame fix actually resolved the fusion misalignment.
+3. Add a reachability check that rejects unreachable grasp candidates before planning.
+4. Replace the open-loop controller with a `FollowJointTrajectory` action server.
 5. Publish captured geometry into the MoveIt planning scene for collision-aware planning.
 6. Begin WP4 evaluation metrics (grasp success rate, task duration).

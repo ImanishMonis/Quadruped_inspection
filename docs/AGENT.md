@@ -700,3 +700,29 @@ correct while the robot physically moved somewhere else. Full detail per item is
 8. **A sparse point cloud is usually a framing problem, not a code bug.** Check `--dump-stats`'s raw
    point count and the depth image's finite-pixel mean first: if the mean sits at the near-clip
    value, the gripper or arm is filling the camera's view and the arm needs repositioning.
+
+9. **Never derive `camera_optical_joint`'s rotation from a UI's Euler-angle display alone —
+   verify against a live ground-truth object position first.** Two independent paper derivations
+   of this rotation (one when it was first set, one this session composing Isaac's RSD455 sensor
+   chain) were both wrong when tested live; one made the error *larger*. The only method that
+   actually worked: print the raw, untransformed grasp translation in `camera_optical_frame`
+   directly in `tf_utils.py`, compare it against a known object position, and solve/verify from
+   that. If the camera's actual USD mount ever changes again (e.g. swapping the RSD455 asset for
+   something else), re-verify this the same way — don't assume the current `rpy` still applies.
+   (BUG-13, BUG-20)
+
+10. **This robot has a fixed base — there is no mobile base (Go1 quadruped) in the current scene.**
+    `isaac_sim_native_gui.py` (a teammate's file, in the separate `humanoid_lab` repo) assumes a
+    mobile base walking around a table; its `read_table_geometry()`/`RIG_PATH`-teleport view
+    planner does not apply here and will crash or silently do nothing useful. Multi-view capture
+    for this robot instead relocates the *arm's own base* using this repo's existing
+    `base_teleport.py` + `isaac_sim_teleport_listener.py` machinery (see `multi_view_capture.py`),
+    exactly like `executor.py`'s `--teleport` path already does for grasp execution.
+
+11. **A camera-pose function that divides out a "world" reference prim must never use a prim that
+    itself gets moved.** `isaac_sim_native_gui.py`'s `WORLD_FRAME_PRIM` was set to
+    `/open_manipulator_x` to work around this stage having no `/World` wrapper Xform — fine until
+    `multi_view_capture.py` started physically teleporting that exact prim for multi-view capture,
+    at which point every recorded camera pose silently had the base relocation divided back out
+    again. Use a prim that's guaranteed to stay fixed (this stage: `/FlatGrid`, a sibling of
+    `open_manipulator_x` at the stage root).

@@ -6,7 +6,7 @@ Living work-tracking document for Claude Code sessions on this repo.
   *state, findings, and what to do next*.
 - **Convention:** append to the Session Log at the bottom each session. Update the checkboxes
   in the Roadmap. Move items out of the Bug Register when fixed (note the commit).
-- **Last updated:** 2026-09-17 (session 5)
+- **Last updated:** 2026-09-20 (session 6)
 - **For a supervisor-facing summary** (status, structure, open issues, next steps) see
   [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — this file is the detailed engineering log behind it.
 
@@ -681,6 +681,59 @@ object position — *derivation on paper alone was insufficient and initially wr
 `pitch=40°` incident) — always verify this kind of thing against real data, not just the rotation
 matrix math.
 
+**BUG-20 — ⭐ `camera_optical_joint`'s rotation was missing a 90° roll; every vertical offset the
+camera saw was injected as a lateral (Y) offset in `link1`. ✅ Fixed, verified against ground
+truth.** BUG-13 had previously fixed a 90°-off rotation on this same joint, but the camera mount
+changed since then (the camera became the full Intel RealSense `RSD455` sensor asset, with its own
+internal `Realsense -> RSD455 -> Camera_Pseudo_Depth` chain, adding rotations that were never
+folded back into this joint) — exactly the "re-verify if the camera's actual USD mount changes"
+warning BUG-13's own fix comment carried. Symptom: `executor.py --no-teleport` with an object
+placed dead-centre in front of the arm still produced a nonzero `Target Y` (`-0.066m`, later
+`-0.054m` at a different pose) — suspiciously close in magnitude to BUG-14's old ~5-10cm residual,
+which is what made this look at first like a re-emergence of BUG-14/16 rather than a new,
+distinct problem.
+
+**First attempt was wrong, and made it worse.** Composed the real `Realsense/RSD455/
+Camera_Pseudo_Depth` rotation chain (Realsense identity, RSD455 180° about Z, `Camera_Pseudo_Depth`
+90°/90°/0° local) on paper from Isaac's Property-panel Euler readout, assuming an intrinsic-XYZ
+convention, and changed `camera_optical_joint`'s `rpy` from `"0 1.5707963 0"` to
+`"1.5707963 1.5707963 3.1415927"`. Tested live against a cylinder at a known world position
+`(0.3, 0, 0)`: **Y got worse, not better** (`-0.066m -> +0.200m`, opposite sign, bigger magnitude)
+and X came back short (`0.094m` instead of `~0.3m`). The Euler-convention assumption was wrong —
+*exactly* the same "derived on paper, verify against real data" lesson BUG-13 already taught,
+re-learned the hard way. Reverted immediately.
+
+**Correct diagnosis, from raw data.** Added a temporary debug print of the *raw, untransformed*
+grasp translation in `camera_optical_frame` (before any rotation is applied) directly in
+`tf_utils.grasp_to_base_pose()`, rather than reasoning about Isaac's UI further. With a good
+AnyGrasp detection (score 0.44) of the same known cylinder, the raw optical-frame reading was
+`(-0.0016, -0.0542, 0.2001)` — i.e. horizontally centred (`x≈0`, the object genuinely is dead
+ahead, confirming the reported symptom), `5.4cm` **above** the optical axis (`y`, and REP-103
+optical convention is `y=down`), `0.20m` forward. `|raw vector| = 0.2759m` vs the true
+camera-to-cylinder distance of `0.2684m` (`7.5mm` apart, consistent with the grasp landing on the
+cylinder's near surface) — confirming depth, intrinsics and the mount's *position* were all
+already correct; only the *rotation* was wrong.
+
+Working through what the **old** `rpy="0 1.5707963 0"` (a pure 90° pitch) actually does to REP-103
+axes: it correctly sends optical `+z` (forward) to `camera_link +x` (the approach axis) — which is
+what BUG-13's fix was aiming for — but sends optical `+y` (down) to `camera_link +y` (the robot's
+*lateral* axis) instead of `camera_link -z` (down). It was missing the 90° **roll** about the
+forward axis. Net effect: every vertical offset the camera saw (a real object sitting above or
+below the optical centreline, completely normal) was injected as a spurious sideways offset in
+`link1` — exactly the reported symptom, and exactly why it looked like a *lateral* miscalibration
+(BUG-14/16) rather than the rotation bug it actually was.
+
+**Fix:** the standard ROS REP-103 optical-to-body rotation, `rpy="-1.5707963 0 -1.5707963"`.
+**Verified two ways:** (1) algebraically, predicts `link1 (0.290, 0.0016, 0.1463)` against the true
+`(0.3, 0.0, ~0.15)` — `10mm` short on X (expected, near-surface grasp point) and `1.6mm` on Y; (2)
+**live**, re-run confirmed working for both a centred object and one shifted to the side.
+
+**Process note for next time:** two independent, well-reasoned *paper* derivations of this same
+rotation (BUG-13's original, and this session's first attempt) were both wrong when tested live.
+The only method that actually worked was: print the raw pre-transform camera-frame value, compare
+it against an exact known ground-truth object position, and solve/verify against that — never trust
+a rotation-matrix derivation from a UI's Euler-angle display without a live check.
+
 ---
 
 ## 6. Roadmap
@@ -1241,3 +1294,81 @@ remains unverified.
 
 **Also created:** [`PROJECT_STATUS.md`](PROJECT_STATUS.md), a supervisor-facing summary of state,
 structure and open issues.
+
+### 2026-09-20 (session 6) — camera rotation bug found and fixed (BUG-20); multi-view capture built for the fixed-base arm
+
+Two threads this session: replicating a teammate's SAM2/Isaac-Sim GUI (`isaac_sim_native_gui.py`,
+lives in the separate `humanoid_lab` repo, not this one) for this robot, and finally root-causing
+the residual grasp-position error BUG-14/16 had left open.
+
+**BUG-20 fixed** — see §5 for the full writeup. Short version: `camera_optical_joint`'s rotation
+was missing a 90° roll, so a real object's vertical offset from the optical axis was silently
+injected as a lateral offset in `link1`. Two paper derivations of the correct rotation were tried
+and both were wrong when tested live; only printing the raw pre-transform camera-frame value and
+solving against a known ground-truth object position worked. **Verified live** for both a centred
+and an off-centre object.
+
+**Multi-view capture (`multi_view_capture.py`, new script)** — built to get more than one view of
+a tracked object for point-cloud fusion, on a robot with a **fixed base** (confirmed this session:
+no Go1 quadruped in the current scene, contrary to `isaac_sim_native_gui.py`'s own assumptions,
+which model a mobile base walking around a table). Iterated through several wrong designs before
+landing on one that works:
+- First version drove the end effector directly to ring positions computed as offsets *from the
+  object* - failed immediately, because the object was already near the arm's ~0.32m safe reach
+  limit, so any outward offset exceeded it.
+- Adopted this project's existing quadruped-mounted-arm base-relocation machinery
+  (`base_teleport.py` + `isaac_sim_teleport_listener.py`, already used by `executor.py`'s
+  `--teleport` path) instead: physically relocate the *base* for left/right views, then reach the
+  arm out from the new, close-by position - every reach then stays inside the arm's own tested
+  envelope.
+- Base position for left/right is a literal sideways shift from the arm's own baseline position
+  (not a standoff-to-object formula), per explicit request; the resulting yaw is computed from the
+  object's own segmented depth data so the camera still faces it. A reach-safety check auto-shrinks
+  an over-large requested shift rather than failing outright.
+- Two real bugs found and fixed along the way: (1) the end effector was reaching to the object's
+  *exact* coordinates with no standoff, driving the gripper up against it - visually indistinguishable
+  from a grasp approach even though nothing in this script closes the gripper; fixed with a
+  `standoff_point()` helper. (2) that same helper originally scaled the standoff pull-back along the
+  full 3D line to the base origin, which sits at `z≈0` (~floor height) - this dragged a low object's
+  reach point toward the floor as a side effect of the horizontal pull-back, causing a real floor
+  collision. Fixed to only pull back horizontally, flooring height separately.
+- **A second, separate root-cause fusion bug found**: `isaac_sim_native_gui.py`'s
+  `WORLD_FRAME_PRIM` had been set to `/open_manipulator_x` (see BUG-19-adjacent fix history) to
+  work around this stage having no `/World` wrapper Xform - fine for single-view capture, but wrong
+  once `multi_view_capture.py` started physically teleporting `/open_manipulator_x` itself: the
+  camera-pose function divides out `WORLD_FRAME_PRIM`'s own transform, so using the very prim being
+  teleported as the "fixed" anchor silently cancelled out every base relocation. Every recorded pose
+  ended up being "camera relative to the robot's own base," not a real fixed frame, so views
+  captured from different teleported positions didn't share a frame when fused.
+  **Measured** via `sam2_service/refine_session_poses.py --dry-run`: 12.6cm object-centroid spread
+  across a 3-view session (tool's own guidance: "ideal ~0-1cm"), and ICP alone could barely correct
+  it (12.6cm -> 12.0cm) - confirming a systematic frame bug, not fusion noise. Fixed by switching
+  `WORLD_FRAME_PRIM` to `/FlatGrid`, a sibling of `open_manipulator_x` at the stage root that never
+  moves. Not yet re-measured after the fix - next session should re-run the same dry-run check.
+- Top-down and "closer" views added as **pure arm motion, no base teleport** (per explicit
+  request): `joint2`/`joint3` raised while subtracting the same total from `joint4` keeps their sum
+  (the end effector's absolute pitch, since all three share an unrotated local Y axis) constant, so
+  the camera keeps facing the object while the arm extends upward - avoids relying on
+  `set_position_target()`'s arbitrary IK solution, which was previously seen to tip the camera up
+  and away from the target.
+
+**Also found and fixed, not directly related to either thread above:**
+- `isaac_sim_native_gui.py` leaked a render product + 2 annotators on every Script Editor re-paste
+  (a pre-existing, documented risk in that file); hardened the cleanup to retry ALL historically-leaked
+  entries every run, not just the most recent one, plus a one-time migration for entries orphaned by
+  the previous single-entry tracking scheme.
+- The SRDF's `stand_up` named state (`joint3=-1.5`) is stale against the 0.05 rad joint-limit
+  margins added in session 5 (`joint3`'s lower bound is now `-1.45`) - `multi_view_capture.py`'s
+  home-pose helper now clamps against live joint bounds rather than trusting any named state as-is.
+- A long-running visual "static" artefact turned out to be two unrelated, non-bugs stacked
+  together: (1) `FlatGrid`'s fine grid texture aliasing against RTX Real-Time's limited real-time
+  sampling at a grazing viewing angle, confirmed present even in the untouched, already-working
+  `/camera/color/image_raw` ROS topic; (2) normal temporal-accumulation noise while the
+  camera-mounted arm is physically moving (confirmed by reproducing it via plain RViz-driven arm
+  motion, with none of this session's scripts running at all). Neither affects capture correctness
+  (captures already happen after a settle delay) - documented so it isn't re-investigated as a code
+  bug next session.
+
+**Not fixed / still open:** re-measure `refine_session_poses.py`'s centroid-spread check after the
+`WORLD_FRAME_PRIM` fix to confirm it actually resolved the fusion misalignment; BUG-5's open-loop
+execution; AnyGrasp still sometimes selects background geometry.

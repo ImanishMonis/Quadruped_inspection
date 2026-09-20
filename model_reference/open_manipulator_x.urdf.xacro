@@ -66,17 +66,38 @@
   <joint name="camera_optical_joint" type="fixed">
     <parent link="camera_link"/>
     <child link="camera_optical_frame"/>
-    <!-- camera_link shares link5's raw orientation (camera_joint above
-         is rpy=0 0 0), so without this, the optical frame's +Z
-         ("forward", per REP-103) points along link5's own +Z - NOT
-         along the gripper's +X approach axis. Pitching the arm down
-         (toward -Z along +X) then tilts the *gripper* down while the
-         *camera* swings toward +Z (up), looking the wrong way.
-         Ry(+90deg) remaps optical +Z onto link5's +X, so a downward
-         gripper pitch also points the camera down. Verified against
-         Isaac Sim's live depth feed transformed through this same TF
-         chain, not just derived on paper - re-verify if this joint,
-         camera_joint above, or the camera's actual USD mount changes. -->
-    <origin xyz="0 0 0" rpy="0 1.5707963 0"/>
+    <!-- FIXED 2026-09-20 (BUG: spurious lateral Y offset on every grasp).
+         This is the standard ROS optical-frame rotation. camera_optical_frame
+         follows REP-103 optical convention: +x right, +y DOWN, +z forward.
+         camera_link shares link5's orientation, where +x is the gripper's
+         approach axis and +z is up.
+
+         The previous value, rpy="0 1.5707963 0" (a pure 90deg pitch), got
+         ONE of the three axes right: it does map optical +z (forward) onto
+         camera_link +x (approach), which is what its original author was
+         fixing. But it is missing the 90deg ROLL about that forward axis,
+         so optical +y ("down") landed on camera_link +y (the robot's
+         LATERAL axis) instead of camera_link -z (down). Net effect: every
+         VERTICAL offset the camera saw was injected as a SIDEWAYS offset in
+         link1, which is why an object dead-centre in front of the arm still
+         produced a nonzero Target Y.
+
+         Diagnosed from raw data rather than derived on paper (an earlier
+         paper derivation from Isaac's Property-panel Euler display assumed
+         the wrong convention and made things worse). With a good AnyGrasp
+         detection (score 0.44) of a cylinder at known world (0.3, 0, 0):
+         the raw camera_optical_frame reading was (-0.0016, -0.0542, 0.2001)
+         - i.e. horizontally centred (x~0, object IS dead ahead), 5.4cm above
+         the optical axis, 0.20m forward. The old rotation turned that 5.4cm
+         of "up" into Target Y=-0.0542. This rotation instead predicts link1
+         (0.290, 0.0016, 0.1463): X 10mm short of the cylinder's centre
+         (expected, the grasp sits on its near surface) and Y within 1.6mm
+         of zero.
+
+         Note the depth/intrinsics/mount POSITION were verified correct and
+         are not involved: |raw camera vector| 0.2759m vs true camera-to-
+         cylinder distance 0.2684m at the observe pose. Only the rotation
+         was ever wrong. -->
+    <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963"/>
   </joint>
 </robot>

@@ -411,6 +411,8 @@ summarised in `AGENT.md`'s "Hard-won constraints" section.
 | Grasp lands far away / above the robot | AnyGrasp picked background geometry, not the object | Check the raw translation's depth and the cloud's Y-spread — a near-constant Y means a flat surface, not an object |
 | `/predict` returns HTTP 500 | Degenerate input (e.g. a 1-point cloud left over from an earlier test) | `head -12` the `.pcd` and check `POINTS` |
 | `go()` returns `True` but the arm didn't arrive | Open-loop controller reports success immediately (BUG-5) | Always verify against `/joint_states` |
+| An object dead-centre in front of the arm still produces a nonzero `Target Y` | `camera_optical_joint`'s rotation is missing a 90° roll — the camera's real *vertical* offset from an object is being injected as a *lateral* offset | Print the raw translation in `camera_optical_frame` (before any TF transform) — a real object dead-ahead should show `x≈0` there; if `Target Y` in `link1` is still nonzero despite that, it's this rotation, not detection (BUG-20) |
+| Multi-view fused point cloud shows a doubled/misaligned edge | The camera-pose function's "fixed" reference prim is itself being teleported during capture, silently cancelling out base relocation | `sam2_service/refine_session_poses.py <session> --dry-run` — object-centroid spread should be ~0-1cm; if it's several cm and ICP barely helps, check `WORLD_FRAME_PRIM` isn't the prim being moved |
 
 ## Quick reference: file locations
 
