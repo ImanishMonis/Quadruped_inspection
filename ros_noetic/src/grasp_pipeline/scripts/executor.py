@@ -31,10 +31,12 @@ HAND_GROUP = "hand"
 GRIP_OPEN_STATE = "Grip_Open"
 GRIP_CLOSE_STATE = "Grip_Close"
 
-# Meters, pulled back along the approach axis from the grasp pose after
-# closing the gripper - deliberately further than the pre-grasp offset
-# so the retreat clears whatever the pre-grasp approach swept through.
-DEFAULT_RETREAT_OFFSET = -0.03
+# Meters, lifted straight UP (link1 +Z) from the grasp pose after closing
+# the gripper. Changed 2026-09-20 at the user's request: this used to be
+# a negative offset along the grasp's own approach axis (pulling back the
+# way it came in), which for a level/sideways grasp just drags the object
+# backward along the surface instead of actually lifting it off.
+DEFAULT_RETREAT_OFFSET = 0.08
 
 CARTESIAN_EEF_STEP = 0.01
 CARTESIAN_MIN_FRACTION = 0.9
@@ -186,8 +188,8 @@ def execute_pick(
             "scene has no matching collision object to attach yet."
         )
 
-    # 5. Straight-line retreat.
-    retreat_pose = tf_utils.offset_along_approach_axis(
+    # 5. Vertical lift, straight up off the surface.
+    retreat_pose = tf_utils.lift_pose(
         grasp_pose,
         retreat_offset,
     )

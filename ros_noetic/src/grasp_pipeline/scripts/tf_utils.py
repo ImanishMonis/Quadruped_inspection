@@ -258,6 +258,26 @@ def offset_along_approach_axis(pose_stamped, distance):
     return offset_pose
 
 
+def lift_pose(pose_stamped, height):
+    """
+    Shift a PoseStamped by `height` meters straight up along +Z of its
+    OWN header frame (link1: Z is up regardless of grasp orientation -
+    see BUG-17, the planar virtual joint preserves Z between link1 and
+    world) - NOT the pose's local approach axis. Used for a vertical lift
+    after closing the gripper, at the user's request: offset_along_
+    approach_axis() retreats along whatever direction the grasp
+    approached from, which for a level/sideways grasp just drags the
+    object backward along the surface instead of picking it up.
+    """
+    lifted = PoseStamped()
+    lifted.header = pose_stamped.header
+    lifted.pose.orientation = pose_stamped.pose.orientation
+    lifted.pose.position.x = pose_stamped.pose.position.x
+    lifted.pose.position.y = pose_stamped.pose.position.y
+    lifted.pose.position.z = pose_stamped.pose.position.z + height
+    return lifted
+
+
 class PoseBroadcaster:
     """
     Continuously re-broadcasts a set of named PoseStamped values as TF

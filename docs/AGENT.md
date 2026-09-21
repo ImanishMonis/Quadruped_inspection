@@ -726,3 +726,26 @@ correct while the robot physically moved somewhere else. Full detail per item is
     at which point every recorded camera pose silently had the base relocation divided back out
     again. Use a prim that's guaranteed to stay fixed (this stage: `/FlatGrid`, a sibling of
     `open_manipulator_x` at the stage root).
+
+12. **`Z_HEIGHT` in `isaac_sim_teleport_listener.py` is a real, load-bearing value — not a
+    formality.** `set_world_pose()` takes a WORLD-space position, and this script passes `Z_HEIGHT`
+    straight into it, so despite claiming to "only move X/Y and yaw" a wrong value here moves the
+    robot vertically on every single teleport. On this robot the base's resting world Z is
+    `-0.09621` (the `/open_manipulator_x` container Xform carries that offset, which is what keeps
+    the base on the floor). It sat at the placeholder `0.0` for a long time, silently lifting the
+    robot 9.6cm per teleport. (BUG-21)
+
+13. **When a USD prim and an Isaac API seem to disagree, check which space each reports before
+    concluding anything.** The Stage Property panel shows a prim's **local** transform relative to
+    its parent; `Articulation.get_world_pose()` reports **world** space. During BUG-21 the `world`
+    prim read `z=+0.09621` in the panel while the API reported `z≈0` — both correct, differing by
+    exactly the container's own `-0.09621`. Also note this stage has no `link1` prim: it was
+    imported from a URDF revision that still had a `world` base link, so Isaac's `world` prim is
+    the same body ROS calls `link1`, and it (not the `/open_manipulator_x` container) is the
+    articulation's actual root body.
+
+14. **The post-grasp retreat is a vertical lift, not a pull-back along the approach axis.**
+    `offset_along_approach_axis()` with a negative offset retreats the way the gripper came in,
+    which for a level/sideways grasp drags the object along the surface rather than picking it up.
+    `executor.py` uses `tf_utils.lift_pose()` instead (straight up along link1 +Z, orientation
+    preserved); `--retreat-offset` is a *lift height* (positive), not a pull-back distance.

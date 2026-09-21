@@ -6,7 +6,7 @@ Living work-tracking document for Claude Code sessions on this repo.
   *state, findings, and what to do next*.
 - **Convention:** append to the Session Log at the bottom each session. Update the checkboxes
   in the Roadmap. Move items out of the Bug Register when fixed (note the commit).
-- **Last updated:** 2026-09-20 (session 6)
+- **Last updated:** 2026-09-21 (session 6b)
 - **For a supervisor-facing summary** (status, structure, open issues, next steps) see
   [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — this file is the detailed engineering log behind it.
 
@@ -734,6 +734,48 @@ The only method that actually worked was: print the raw pre-transform camera-fra
 it against an exact known ground-truth object position, and solve/verify against that — never trust
 a rotation-matrix derivation from a UI's Euler-angle display without a live check.
 
+**BUG-21 — ⭐ base teleport lifted the robot 9.6cm off the floor every time; `Z_HEIGHT` was an
+unverified placeholder. ✅ Fixed, verified live.** Symptom: running `executor.py` WITH base
+relocation made the robot visibly rise in Isaac Sim, while MoveIt/RViz showed it moving forward
+normally — the same "every printed value is right, the physical robot does something else" shape as
+BUG-19. Initially suspected to be fallout from BUG-20's rotation fix (it was not: the teleport path
+never touches the camera rotation).
+
+**Ruled out first, in this order, each with live data rather than reasoning:**
+- *Grasp math.* Every logged value was correct and consistent: `Target Z: 0.0285m` for a
+  ground-level object, base target published as planar `(x, y, yaw)` only.
+- *The teleport command itself.* `isaac_sim_teleport_listener.py` hardcodes Z and prints it —
+  `z=0.000` in every log line, so nothing upstream could inject a Z change.
+- *A nested-RigidBodyAPI conflict.* PhysX was loudly warning `Rigid Body of (.../RSD455) missing
+  xformstack reset when child of rigid body (.../link5) ... will cause unpredicted results` — the
+  RSD455 sensor asset shipped with its own `RigidBodyAPI`, nested inside link5's. Removing that API
+  (plus its companion `Mass`) silenced the warning but did **not** fix the rise. Worth keeping
+  removed regardless; it was a real (if separate) scene-authoring fault.
+- *PhysX dragging the root after the fact.* Added a temporary post-teleport watcher printing the
+  articulation's world pose every 20 app-update frames for 180 frames: Z held at `+0.0000` the whole
+  time, quaternion stayed pure-yaw. No drift, no fixed-joint fight.
+
+**What actually found it** was inspecting the prims directly in the Stage tree rather than trusting
+any readback: `/open_manipulator_x` (the container Xform carrying `PhysicsArticulationRootAPI`) sits
+at `z=-0.09621`, and that offset is what keeps the base on the floor instead of sunk under it. The
+articulation's actual root body is the child prim named `world` (this stage has no `link1` prim — it
+was imported from a URDF revision that still had a `world` base link, so Isaac's `world` prim ≡
+ROS's `link1`). `set_world_pose()` takes a **world-space** position, and we were handing it
+`Z_HEIGHT = 0.0` — a placeholder the script's own docstring had flagged `VERIFY` and nobody ever
+had. The base's true resting world Z is `-0.09621`, so every teleport lifted it by exactly 9.6cm.
+
+**A readback that looked like a contradiction, and wasn't.** The Property panel showed the `world`
+prim at `z=+0.09621` while `Articulation.get_world_pose()` reported `z≈2.9e-11`. Both were right:
+the panel shows the prim's **local** transform relative to its container, and `-0.09621 + 0.09621 =
+0`, the world-space value the API reported. Misreading that local value as world-space sent this
+investigation down a wrong path for a while — when cross-checking a prim against an API, confirm
+which space each one is reporting in before concluding they disagree.
+
+**Fix:** one constant, `Z_HEIGHT = -0.09621` in `isaac_sim_teleport_listener.py`. **Verified live:**
+base now holds floor level through teleports, moving in X/Y/yaw only. Also promoted that file's v3
+approach from "not yet verified live" to verified, since the watcher confirmed `set_world_pose()`
+itself behaves correctly on this robot.
+
 ---
 
 ## 6. Roadmap
@@ -1372,3 +1414,33 @@ landing on one that works:
 **Not fixed / still open:** re-measure `refine_session_poses.py`'s centroid-spread check after the
 `WORLD_FRAME_PRIM` fix to confirm it actually resolved the fusion misalignment; BUG-5's open-loop
 execution; AnyGrasp still sometimes selects background geometry.
+
+### 2026-09-21 (session 6b) — base-teleport Z bug (BUG-21); retreat changed to a vertical lift
+
+**BUG-21 fixed** — see §5. Short version: base relocation lifted the robot 9.6cm off the floor on
+every teleport, because `Z_HEIGHT` in `isaac_sim_teleport_listener.py` was still the placeholder
+`0.0` its own docstring had flagged `VERIFY`. The base's real resting world Z is `-0.09621`. Four
+other candidate causes were ruled out with live data first (grasp math, the teleport command, a
+genuine nested-`RigidBodyAPI` fault on the RSD455 asset, and PhysX drift after the set); the answer
+came from reading the prims in the Stage tree directly. Along the way, confirmed
+`Articulation.set_world_pose()` does work correctly on this robot — X/Y/yaw land exactly and hold
+steady across 180 physics frames — so that file's long-standing "v3 not yet verified live" caveat is
+now resolved.
+
+**Retreat is now a vertical lift.** `executor.py`'s post-grasp retreat used
+`offset_along_approach_axis()` with a negative offset, i.e. it backed out along whatever direction
+the grasp came in from. For a level/sideways grasp that just drags the object along the surface
+instead of picking it up. Added `tf_utils.lift_pose()` (shift straight up along link1 +Z, preserving
+orientation) and switched the retreat step to it; `DEFAULT_RETREAT_OFFSET` changed from `-0.05`
+(pull-back distance) to `+0.08` (lift height). `--retreat-offset` still works, it just means lift
+height now.
+
+**Also removed:** the RSD455 sensor asset's own `RigidBodyAPI` + `Mass` schemas, which were nested
+inside `link5`'s rigid body. PhysX was explicitly warning this "will cause unpredicted results".
+It turned out not to be the Z bug, but it's a real scene-authoring fault and should stay removed.
+
+**Noted for later, not fixed:** `compute_base_placement()`'s top-down test is
+`horiz_norm < 0.1`, which is very strict — a grasp with approach `[0.41, 0.11, -0.91]` (91% vertical)
+measured `horiz_norm = 0.42` and was handled as a *side* grasp, so the base was placed along a
+near-vertical approach heading, which is close to meaningless geometrically. Only affects base yaw,
+not reach, so it has not caused a visible failure yet.

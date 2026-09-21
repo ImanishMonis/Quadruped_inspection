@@ -60,7 +60,10 @@ assumption (see AGENT_SESSION.md BUG-17 for the full account each time):
   simulating - it correctly propagates into the live PhysX articulation
   state (including satisfying whatever fixed-to-world joint anchors the
   root), unlike raw USD edits which only take effect at stage
-  parse/(re)initialization time. Not yet verified live - try this next.
+  parse/(re)initialization time. VERIFIED LIVE 2026-09-21: X/Y/yaw land
+  exactly as commanded and hold steady across 180 physics frames (no
+  PhysX drift, no fixed-joint fight). The one real bug found was Z_HEIGHT
+  below being an unverified placeholder - see its comment.
 """
 
 import threading
@@ -74,7 +77,24 @@ from omni.isaac.core.utils.rotations import euler_angles_to_quat
 
 # --- fill these in for your stage before running ---
 ARTICULATION_ROOT_PATH = "/open_manipulator_x"  # VERIFY - see docstring above
-Z_HEIGHT = 0.0  # VERIFY - the robot's current Z in the stage
+# VERIFIED 2026-09-21 (was 0.0, an unverified placeholder - THIS was the bug
+# that made the robot rise ~9.6cm on every teleport). This script claims to
+# only move the robot in X/Y and yaw, but it passes Z_HEIGHT straight into
+# set_world_pose(), so a wrong value here moves it in Z too.
+#
+# set_world_pose() takes a WORLD-space position. The robot's base link rests
+# at world z=-0.09621 (the "/open_manipulator_x" container Xform itself sits
+# at z=-0.09621, which is what keeps the base on the floor rather than sunk
+# under it). Commanding z=0.0 therefore lifted the base by exactly 0.09621 m
+# every single time.
+#
+# Careful reading the Property panel when re-verifying this: the "world" prim
+# (the articulation's actual root body, NOT the "/open_manipulator_x"
+# container) shows a LOCAL translate relative to that container, so it read
+# +0.09621 there while its true world-space Z was 0.0. Articulation.
+# get_world_pose() reports world space and agreed (z~2.9e-11). The two only
+# look contradictory if the container's own -0.09621 offset is overlooked.
+Z_HEIGHT = -0.09621
 TOPIC = "/isaac/base_teleport_absolute"
 # ----------------------------------------------------
 
@@ -102,6 +122,7 @@ def _apply_pending():
     the simulation/articulation directly from the rospy callback's
     thread."""
     global _pending
+
     with _lock:
         pose = _pending
         _pending = None
@@ -132,6 +153,13 @@ def _apply_pending():
     print(f"[isaac_sim_teleport_listener] Set articulation "
           f"'{ARTICULATION_ROOT_PATH}' world pose to x={x:.3f} y={y:.3f} "
           f"z={Z_HEIGHT:.3f} yaw={yaw_rad:.3f}rad")
+
+    # If this ever needs re-debugging: art.get_world_pose() reports the root
+    # body's WORLD-space pose and can be printed here to check the teleport
+    # actually landed. Watching it across several subsequent app-update frames
+    # (i.e. real physics steps) also catches PhysX dragging the root away
+    # afterwards - that was ruled out for this robot on 2026-09-21 (Z held
+    # steady for 180 frames), but it's the right check if it resurfaces.
 
 
 def start():

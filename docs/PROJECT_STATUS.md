@@ -4,7 +4,7 @@
 **Supervisor:** Niklas Mueller-Goldingen
 **Work package:** WP3 — Grasp pose estimation, MoveIt planning, execution
 **Platform:** ROBOTIS OpenManipulator-X (4-DOF) + Intel RealSense D455, validated in Isaac Sim 4.5
-**Last updated:** 2026-09-20
+**Last updated:** 2026-09-21
 
 ---
 
@@ -117,9 +117,13 @@ docs/
    lateral offset in the robot's frame. Fixed and verified live against a known object position,
    both centred and off-centre.
 
-4. **Physical base relocation in simulation is verified for grasp execution, but a related
-   multi-view fusion frame bug was found and fixed.** `executor.py --teleport`'s base relocation
-   works. Separately, `isaac_sim_native_gui.py` (the multi-view capture GUI, teammate's repo) used
+4. ~~**Physical base relocation in simulation is unverified.**~~ **Resolved (BUG-21).** Base
+   relocation is now verified live: the robot lands exactly at the commanded (x, y, yaw) and holds
+   position across physics steps. A real bug was found and fixed here — the teleport was lifting the
+   robot 9.6cm off the floor every time, because the listener's `Z_HEIGHT` constant was still an
+   unverified placeholder (`0.0`) rather than the base's actual resting height (`-0.09621`).
+   Separately, a related **multi-view fusion frame bug** was found and fixed:
+   `isaac_sim_native_gui.py` (the multi-view capture GUI, teammate's repo) used
    the wrong "fixed" reference prim for reporting camera poses — one that itself gets teleported
    during multi-view capture — which silently cancelled out the base relocation in every recorded
    pose. Fixed by switching to a prim that's actually fixed (`/FlatGrid`); **not yet re-verified**
@@ -143,6 +147,8 @@ cases where every printed value looked correct while the robot physically moved 
 | Straight-line (Cartesian) approach always failed | The arm is 4-DOF and uses position-only IK, so it cannot satisfy the orientation constraints a Cartesian path requires. Replaced with a direct position target. |
 | Point clouds were extremely sparse | Not a software fault — the arm pose put the gripper in front of the camera, so most of the frame was near-clip noise. Identified by inspecting the raw depth image directly. |
 | AnyGrasp service returned HTTP 500 on every request | A grasp-filtering function indexed the SDK's grasp container with a list, which it does not support. Disabled it in favour of filtering on the ROS side, where the world orientation is actually known. |
+| Robot rose ~9.6cm off the floor on every base relocation | The teleport listener's `Z_HEIGHT` constant was an unverified placeholder (`0.0`) passed straight into a world-space pose call, while the robot's base actually rests at `z=-0.09621`. Four other causes were ruled out with live data first (grasp math, the teleport command, a nested rigid-body fault, PhysX drift); found by reading the prims directly in the Stage tree. |
+| Object was dragged along the surface instead of lifted after grasping | The post-grasp retreat backed out along the grasp's own approach axis, which for a level/sideways grasp moves horizontally. Replaced with a vertical lift along the robot's +Z. |
 | A centred object still produced a nonzero lateral (Y) grasp offset | `camera_optical_joint`'s rotation was missing a 90° roll, so the camera's real vertical offset from an object was injected as a lateral offset in the robot's frame. Two paper derivations of the correct rotation were tried and both were wrong when tested live (one made the error larger); fixed by printing the raw, untransformed camera-frame translation and solving directly against a known object position. Verified for both a centred and an off-centre object. |
 
 A full engineering log with reproduction steps for each is maintained in `AGENT_SESSION.md`.
