@@ -15,6 +15,31 @@ which machine that is.
 
 ---
 
+## Quick start (the three commands)
+
+Assuming the containers are up, Isaac Sim is playing with the scene loaded,
+and the AnyGrasp server is running (§0-§4 below cover those):
+
+```bash
+# 1. Get into the ROS container (host terminal)
+docker exec -it ros_noetic bash
+
+# 2. Capture a point cloud from the live camera (inside the container)
+cd /root/ws_moveit/src/grasp_pipeline/scripts
+python3 live_capture.py
+
+# 3. Run the pick
+python3 executor.py \
+  --scene /tmp/live_scene.pcd \
+  --object /tmp/live_object.pcd \
+  --no-teleport
+```
+
+That's the whole happy path. §5 explains each step, the flags, and what to
+check in the output; §10 maps symptoms to causes when something misbehaves.
+
+---
+
 ## 0. Containers up
 
 ```bash
@@ -93,7 +118,14 @@ If `trajectory_bridge` is missing, MoveIt's plans will "succeed" but the
 robot in Isaac Sim will never move - see `AGENT_SESSION.md`'s session log
 entry on this exact failure mode.
 
-## 4. Example point clouds into the container (one-time)
+## 4. Example point clouds into the container (one-time, LEGACY)
+
+> **Not the normal path any more.** The pipeline is normally driven from a
+> live capture (§5.1), which is strictly better: the cloud and the TF lookup
+> then come from the same camera at the same arm pose. These canned clouds
+> are kept only as an offline fallback when Isaac Sim isn't available - and
+> they have a known failure mode, see §7.
+
 
 ```bash
 docker exec ros_noetic mkdir -p /root/ws_moveit/src/grasp_pipeline/example_data
@@ -108,52 +140,145 @@ already shows both files.
 
 ## 5. Run the pipeline, stage by stage
 
-Open a shell in `ros_noetic` and source everything:
+### 5.0 Get a shell inside `ros_noetic`
+
+Everything in this section runs **inside the container**, not on the host.
+From a host terminal:
 
 ```bash
 docker exec -it ros_noetic bash
+```
+
+That gives you an interactive shell where ROS is already sourced via
+`.bashrc`. If you ever run something with `bash -c` instead (non-interactive),
+that `.bashrc` is skipped by its own early-return guard and you'll get
+`rospack: command not found` - source it explicitly in that case:
+
+```bash
 source /opt/ros/noetic/setup.bash
-source ~/ws_moveit/devel/setup.bash
+source /root/ws_moveit/devel/setup.bash
+```
+
+Then, for GUI tools (RViz, `image_view`) and the scripts directory:
+
+```bash
+export DISPLAY=:1
 cd /root/ws_moveit/src/grasp_pipeline/scripts
 ```
 
-Run each of these **from inside that shell**, in order, reading the
-output before moving to the next one:
+> The host path `~/ws_moveit_clean/src/grasp_pipeline/scripts` is bind-mounted
+> to `/root/ws_moveit/src/grasp_pipeline/scripts` inside the container, so
+> edits made on the host are live here immediately - no `docker cp` needed.
+
+### 5.1 Capture a point cloud from the live camera
+
+`live_capture.py` grabs a frame from Isaac Sim's simulated RealSense and
+writes two clouds: the full scene, and the depth-filtered "object".
+
+**Check the framing first.** `--dump-stats` prints the raw cloud's extent
+and point count and exits **without writing anything** - use it to confirm
+the camera is actually looking at the object before capturing:
 
 ```bash
-# 1) Call AnyGrasp directly, print top-5 grasps as JSON
-python3 grasp_client.py \
-  --scene /root/ws_moveit/src/grasp_pipeline/example_data/scene.pcd \
-  --object /root/ws_moveit/src/grasp_pipeline/example_data/object.pcd \
-  --top-k 5
+python3 live_capture.py --dump-stats
 ```
 
-```bash
-# 2) Convert the best grasp -> link1 frame, print it, and broadcast it
-#    live as a TF frame named "grasp_pose" for as long as this runs.
-#    Open RViz (Add -> TF, or Add -> Axes with frame "grasp_pose") and
-#    LOOK where it lands relative to the real arm before trusting it -
-#    this is the frame-convention check AGENT_SESSION.md flags as
-#    mandatory, not optional. Ctrl+C to stop.
-python3 tf_utils.py \
-  --scene /root/ws_moveit/src/grasp_pipeline/example_data/scene.pcd \
-  --object /root/ws_moveit/src/grasp_pipeline/example_data/object.pcd
-```
+If the point count is tiny or the depth mean sits at the near-clip value,
+that's a framing problem (the gripper/arm is filling the camera view), not
+a code bug - reposition the arm and re-check. See §10.
+
+Once the stats look sane, capture for real:
 
 ```bash
-# 3) Print the planned pre-grasp + grasp waypoints (no motion yet)
-python3 grasp_planner.py \
-  --scene /root/ws_moveit/src/grasp_pipeline/example_data/scene.pcd \
-  --object /root/ws_moveit/src/grasp_pipeline/example_data/object.pcd
+python3 live_capture.py
 ```
 
+Writes `/tmp/live_scene.pcd` and `/tmp/live_object.pcd` (override with
+`--scene-out` / `--object-out`). The object mask is a plain depth range;
+tune it for your scene with `--object-min-depth` / `--object-max-depth`.
+
+> **Re-capture whenever the arm moves.** These are static files, but
+> `executor.py` transforms them using the *current* TF. If the arm has moved
+> since the capture (e.g. after a previous pick), the transform will be wrong.
+> Capture from the same pose you intend to execute from.
+
+### 5.2 Run the pick
+
 ```bash
-# 4) Run the actual pick through MoveIt - watch the Isaac Sim viewport.
-#    Expected: gripper opens -> arm moves to pre-grasp -> straight-line
-#    approach -> gripper closes -> straight-line retreat.
 python3 executor.py \
-  --scene /root/ws_moveit/src/grasp_pipeline/example_data/scene.pcd \
-  --object /root/ws_moveit/src/grasp_pipeline/example_data/object.pcd
+  --scene /tmp/live_scene.pcd \
+  --object /tmp/live_object.pcd \
+  --no-teleport
+```
+
+`--no-teleport` keeps the base where it is and just reaches with the arm -
+start here, it's the simpler path and isolates arm/frame problems from
+base-relocation ones.
+
+Expected: gripper opens -> arm moves straight to the grasp pose -> gripper
+closes -> arm **lifts straight up** (the retreat is a vertical lift, not a
+pull-back along the approach axis - see `AGENT.md` constraint 14).
+
+Watch the printed block before trusting the motion:
+
+```
+Planned Grasp in Teleported Arm Frame (link1):
+Target X: 0.2489 m
+Target Y: -0.0542 m
+Target Z: 0.0375 m
+```
+
+For an object dead-centre in front of the arm, `Target Y` should be near
+zero. If it isn't, that's the camera-rotation class of bug - see §10 and
+BUG-20.
+
+**With base relocation** (drop `--no-teleport`), which computes and applies a
+base placement first:
+
+```bash
+python3 executor.py \
+  --scene /tmp/live_scene.pcd \
+  --object /tmp/live_object.pcd
+```
+
+This additionally requires `isaac_sim_teleport_listener.py` to be **running
+inside Isaac Sim** (pasted into its Script Editor - it cannot be started from
+the container). Without it the base command is published but nothing moves.
+
+Useful flags:
+
+| Flag | What it does |
+|---|---|
+| `--no-teleport` | Fixed base, arm-only reach (start here) |
+| `--teleport-only` | Compute + publish the base placement, skip arm motion |
+| `--level-only` | Only accept a grasp whose approach is parallel to the ground |
+| `--max-tilt-deg N` | How far off level still counts as level (with `--level-only`) |
+| `--top-k N` | How many AnyGrasp candidates to consider (with `--level-only`) |
+| `--retreat-offset N` | Lift height in metres after closing the gripper (default 0.08) |
+| `--hold-viz-sec N` | Keep broadcasting `grasp_pose`/`retreat_pose` TF this long after the run |
+| `--no-visualize` | Don't broadcast those TF frames at all |
+
+### 5.3 Optional: run the intermediate stages individually
+
+Useful when something's wrong and you want to isolate which stage:
+
+```bash
+# Call AnyGrasp directly, print top-5 grasps as JSON
+python3 grasp_client.py \
+  --scene /tmp/live_scene.pcd --object /tmp/live_object.pcd --top-k 5
+```
+
+```bash
+# Convert the best grasp -> link1 frame, print it, and broadcast it live as
+# a TF frame named "grasp_pose". Open RViz (Add -> TF, or Add -> Axes with
+# frame "grasp_pose") and LOOK where it lands relative to the real arm
+# before trusting it. Ctrl+C to stop.
+python3 tf_utils.py --scene /tmp/live_scene.pcd --object /tmp/live_object.pcd
+```
+
+```bash
+# Print the planned grasp waypoints (no motion)
+python3 grasp_planner.py --scene /tmp/live_scene.pcd --object /tmp/live_object.pcd
 ```
 
 ## 6. Useful checks while any of the above runs
@@ -168,7 +293,7 @@ docker exec ros_noetic bash -c "source /opt/ros/noetic/setup.bash && rosnode lis
 docker exec anygrasp_display tail -30 /tmp/anygrasp_server.log                                         # AnyGrasp server errors
 ```
 
-## 7. If step 5.4 (`executor.py`) times out
+## 7. If `executor.py` (§5.2) times out
 
 This happened during initial testing: `ABORTED: TIMED_OUT` trying to reach
 the pre-grasp pose, even at 10s x 10 planning attempts.
@@ -213,7 +338,7 @@ log for current status before assuming it still needs doing.
 
 If the diagnostic plan *succeeds*, that instead points at the rotation
 offset in `tf_utils.py` (`ROTATION_OFFSET_QUATERNION`) - re-read that
-module's docstring and verify empirically in RViz (step 5.2 above) which
+module's docstring and verify empirically in RViz (§5.3 above) which
 axis is actually wrong. **As of session 4, the live and git copies of this
 constant disagree with each other and with the module's own docstring -
 see `AGENT_SESSION.md` BUG-15 before trusting either one.**
